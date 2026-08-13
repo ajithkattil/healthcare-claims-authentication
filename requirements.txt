@@ -1,0 +1,6 @@
+langgraph==1.2.11
+langgraph-checkpoint-sqlite==3.1.1
+cohere==7.0.8
+pinecone==7.*
+requests
+python-dotenv
