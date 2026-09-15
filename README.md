@@ -123,6 +123,49 @@ the docstring in each script for what a real deployment would need to add before
 touching actual Protected Health Information (PHI) under HIPAA — this POC does not
 implement encryption, BAAs with vendors, or access logging.
 
+## PII/PHI Handling
+
+PII protection isn't one control, it's four separate layers, each catching a different
+failure mode. It's worth being precise about which layer is actually implemented in this
+POC's code today vs. designed on paper vs. a different concern entirely (build-time
+hygiene, not runtime protection) — conflating them is the easiest way to give a vague
+answer to a direct interview question.
+
+1. **Perimeter tokenization (designed, not in POC).** Structured PII fields — patient ID,
+   provider ID — get tokenized at the API gateway, before a claim ever reaches the graph,
+   by a vault-backed `Tokenizer` class (see `production_additions_explainer.md` Section 3).
+   Every downstream component — the embedding cache, the vector store, the LLM prompt, the
+   Zapier payload — then operates only on the token, never the raw identifier. In this
+   POC, there's no gateway and no tokenizer; instead every patient ID is already a
+   synthetic mock value (`PAT-1010`) and every narrative is made-up text, so the problem
+   is sidestepped by construction rather than solved by a redaction pipeline.
+2. **In-flight guardrail, on free text (implemented, narrow).** Structured-field
+   tokenization above only catches known fields — it says nothing about PII typed directly
+   into prose. `run_input_guardrail` is the real, running code for this: one regex check
+   for an SSN-shaped string (`\d{3}-\d{2}-\d{4}`) in the claim narrative, and the claim is
+   rejected outright — before it's embedded, sent to any LLM, or forwarded to Pinecone or
+   Zapier — if it matches. This is the one layer that's actually implemented and testable
+   in this repo today. It's also the narrowest: it wouldn't catch a name, a date of birth,
+   an MRN, a phone number, or an SSN written without dashes. A production version would add
+   NER-based detection alongside the regex, not replace it.
+3. **RBAC-gated resolution (designed, not in POC).** Token-to-PHI resolution is its own
+   separately audited call, gated to specific roles — never an implicit side effect of
+   another action (e.g., a claim getting escalated to SIU doesn't itself reveal the real
+   patient identity to the reviewer's tooling; requesting the real value is a distinct,
+   logged operation). This is the point worth defending if pushed on "how do you prevent
+   PII from leaking sideways through some other feature."
+4. **Build-time scanning (a different concern, not implemented here).** Static analysis /
+   secret-scanning (a Maven `pom.xml` plugin, a pre-commit hook, tools like gitleaks or
+   truffleHog) catches PII or credentials that leak into source code or config files
+   before deployment. This is real and worth having, but it protects the *codebase*, not
+   *live claims data flowing through the running system* — a common conflation to avoid
+   when explaining this out loud.
+
+The honest summary: today's code has one narrow, regex-based guardrail and synthetic-only
+data; the tokenization perimeter and RBAC-gated resolution are designed but not built,
+and scoped out of this POC deliberately alongside multi-tenancy and the API gateway they
+depend on (see `production_additions_explainer.md`).
+
 ## Architecture
 
 ![Healthcare Claims Authentication architecture diagram](architecture_diagram_final.png)
@@ -552,7 +595,7 @@ Run through these to confirm the POC behaves as documented:
 - Fraud detection logic combines deterministic rules, hybrid similarity, and LLM
   reasoning — none of these are a trained fraud model
 - No authentication, encryption, or PHI-handling hardening — do not point this at
-  real patient/claim data as-is (see the PHI note near the top of this file)
+  real patient/claim data as-is (see the [PII/PHI Handling](#piiphi-handling) section above)
 - SQLite checkpointing is fine for a single-process POC; a concurrent production
   deployment should move to a Postgres-backed checkpointer
 - The Zapier notification call is not idempotent — a checkpoint replay after a crash
