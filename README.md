@@ -263,16 +263,21 @@ this:
 | A node function (`state -> dict` of updates) | An `@start()` / `@listen()` method on the `Flow` subclass, mutating `self.state.field` directly instead of returning a partial dict for a reducer to merge |
 | `route_after_X(state) -> str` + the `add_conditional_edges` mapping dict | An `@router()` method returning the same label string, paired with `@listen("label")` methods — the same "return a string key, branch on it" shape |
 | Parallel fan-out/fan-in (`retrieve_guidelines` → both specialists → `supervisor_synthesize`) | `@listen(and_(billing_coding_specialist, narrative_fraud_specialist))` on `supervisor_synthesize` — CrewAI's `and_()`/`or_()` helpers exist specifically for this |
-| `SqliteSaver` checkpointer | The `@persist` decorator — backed by `SQLiteFlowPersistence` by default, the same storage engine this repo already uses |
+| `SqliteSaver` checkpointer (run/thread state) | The `@persist` decorator — backed by `SQLiteFlowPersistence` by default, the same storage engine this repo already uses |
+| The embedding cache (`_cache_init`/`_cache_get`/`_cache_put`, `embedding_cache.sqlite`) | **No change at all.** It's plain `sqlite3` code with its own separate database file — not part of the checkpointer, and not something LangGraph or CrewAI provides or manages either way. It's easy to mistake for "the same thing" as the checkpointer above since both happen to use SQLite, but they solve different problems (avoiding a redundant Cohere call vs. resuming a paused run) and neither engine's persistence API touches it |
 | `thread_id` (`config["configurable"]["thread_id"]`) | `self.state.id`, a UUID CrewAI auto-generates per flow run; resuming a specific run is `kickoff(inputs={"id": <uuid>})` |
 | `interrupt_before=["route_to_siu_review"]` + `graph.get_state`/`update_state`/`invoke(None, config)` | The `@human_feedback(message=..., emit=[...])` decorator — arguably a *cleaner* fit for this exact case than LangGraph's more general `interrupt_before`, since named outcomes (`"APPROVED_BY_DEMO_REVIEWER"` / `"DENIED_BY_DEMO_REVIEWER"`) are a first-class concept instead of a generic pause-and-patch-state pattern |
 | `billing_coding_specialist` / `narrative_fraud_specialist` as single-shot LLM calls | Could stay exactly as-is (plain function calls inside a `Flow` method), or be upgraded to real CrewAI `Agent`s inside a `Crew` if you wanted them to become genuinely autonomous reasoning loops rather than single-shot calls — see the honest caveat in the Agentic AI Pattern Mapping's Section 4 about this being "a fixed pipeline wearing supervisor/worker naming" today |
 
 **What wouldn't change at all:** every guardrail function, `model_gateway_decide`, the
 hybrid retrieval (`_hybrid_rank`, `pinecone_query_hybrid`, `retrieve_guidelines_hybrid`),
-both specialists' review functions, `supervisor_synthesize_findings`, and
-`evaluator_optimizer_faithfulness_check` — all copy-paste unchanged, called as plain
-functions from inside whichever `Flow` method needs them.
+both specialists' review functions, `supervisor_synthesize_findings`,
+`evaluator_optimizer_faithfulness_check`, and the entire embedding cache
+(`_cache_init`/`_cache_get`/`_cache_put`) — all copy-paste unchanged, called as plain
+functions from inside whichever `Flow` method needs them. The cache in particular is worth
+being precise about in conversation: it's a second, independent SQLite database
+(`embedding_cache.sqlite`), not part of the checkpointer/persistence layer at all, so
+swapping orchestrators has zero effect on it either way.
 
 **A rough phased plan**, in the order it'd actually get done: (1) redefine `ClaimState` as
 a Pydantic model; (2) port each LangGraph node to a `Flow` method — mostly mechanical,
