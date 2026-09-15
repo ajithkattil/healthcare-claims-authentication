@@ -62,6 +62,21 @@ identified by comparing this project against a real production narrative:
      *faithfulness*) and is the second independent safety net over the
      supervisor's output.
 
+  7. LLM MODEL GATEWAY. model_gateway_route sits between retrieval and the
+     specialist fan-out and picks which model TIER the two specialists
+     reason with, per claim, based on a deterministic complexity score
+     (model_gateway_decide) -- NOT an LLM call itself, which would defeat
+     the point of saving cost. A claim that's obviously clean, or an
+     obvious near-exact match to a known fraud case, is easy to classify
+     correctly even with a cheap/fast model; a claim sitting in the
+     genuinely ambiguous similarity band, or carrying rule flags plus a
+     high dollar amount, gets routed to the more capable (and more
+     expensive) tier instead. This is the same shape as a production LLM
+     gateway: route the bulk of easy traffic cheaply, reserve the
+     expensive model for the requests that actually need it, rather than
+     paying frontier-model prices for every request regardless of
+     difficulty.
+
 Run: python3 04_claims_auth_hybrid_rag_confidence_circuitbreaker.py
 """
 
@@ -85,7 +100,12 @@ PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "claims-fraud-cases")
 ZAPIER_WEBHOOK_URL = os.environ.get("ZAPIER_WEBHOOK_URL")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-LLM_MODEL = "claude-sonnet-5"
+# Two model tiers the gateway routes between (see model_gateway_decide).
+# EVALUATOR_MODEL is separate and always cheap -- the faithfulness check's
+# job is narrow and mechanical regardless of how hard the claim itself was.
+CHEAP_MODEL = "claude-haiku-4-5"
+EXPENSIVE_MODEL = "claude-sonnet-5"
+EVALUATOR_MODEL = "claude-haiku-4-5"
 
 CACHE_DB_PATH = "embedding_cache.sqlite"
 MAX_TOOL_ERRORS = 2
@@ -266,13 +286,14 @@ def zapier_notify(payload: dict) -> dict:
     return {"status_code": 200, "mock": True}
 
 
-def billing_coding_specialist_review(claim_id: str, rule_flags: list[str], guidelines: list[dict]) -> dict:
+def billing_coding_specialist_review(claim_id: str, rule_flags: list[str], guidelines: list[dict], model: str = EXPENSIVE_MODEL) -> dict:
     """
     Narrow specialist #1: CPT/ICD code plausibility against retrieved
     billing-guideline text ONLY. Never sees the narrative or FWA case
     matches -- sub-agent isolation, so this specialist's context can't
     bloat with fields it has no use for and its prompt/tier can be tuned
-    independently of the narrative specialist's.
+    independently of the narrative specialist's. `model` is chosen upstream
+    by model_gateway_route, per claim, not hardcoded here.
     """
     guideline_block = "\n".join(f"- [{g['id']}] {g['text']}" for g in guidelines)
     prompt = (
@@ -287,12 +308,14 @@ def billing_coding_specialist_review(claim_id: str, rule_flags: list[str], guide
     if USE_LIVE_APIS:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        resp = client.messages.create(model=LLM_MODEL, max_tokens=200, messages=[{"role": "user", "content": prompt}])
+        resp = client.messages.create(model=model, max_tokens=200, messages=[{"role": "user", "content": prompt}])
         raw_text = resp.content[0].text
         try:
-            return json.loads(raw_text)
+            result = json.loads(raw_text)
         except json.JSONDecodeError:
-            return {"_malformed_raw_output": raw_text}
+            return {"_malformed_raw_output": raw_text, "model_used": model}
+        result["model_used"] = model
+        return result
 
     cited_guideline = guidelines[0]["id"] if guidelines else "no guideline retrieved"
     if rule_flags:
@@ -300,19 +323,22 @@ def billing_coding_specialist_review(claim_id: str, rule_flags: list[str], guide
             "finding": "coding_concern",
             "rationale": f"{len(rule_flags)} rule-based flag(s) present; potentially inconsistent with {cited_guideline}.",
             "confidence": round(min(0.55 + 0.1 * len(rule_flags), 0.95), 2),
+            "model_used": model,
         }
     return {
         "finding": "consistent",
         "rationale": f"No rule-based flags; billed code(s) consistent with {cited_guideline}.",
         "confidence": 0.9,
+        "model_used": model,
     }
 
 
-def narrative_fraud_specialist_review(claim_id: str, narrative: str, similar_cases: list[dict]) -> dict:
+def narrative_fraud_specialist_review(claim_id: str, narrative: str, similar_cases: list[dict], model: str = EXPENSIVE_MODEL) -> dict:
     """
     Narrow specialist #2: free-text narrative against confirmed-FWA case
     matches ONLY. Never sees the guideline corpus or rule flags -- the
-    counterpart isolation to the billing specialist above.
+    counterpart isolation to the billing specialist above. `model` is
+    chosen upstream by model_gateway_route, per claim, not hardcoded here.
     """
     similar_block = "\n".join(f"- [{c['id']}] fused_score={c['fused_score']} :: {c.get('text', '')}" for c in similar_cases)
     prompt = (
@@ -327,12 +353,14 @@ def narrative_fraud_specialist_review(claim_id: str, narrative: str, similar_cas
     if USE_LIVE_APIS:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        resp = client.messages.create(model=LLM_MODEL, max_tokens=200, messages=[{"role": "user", "content": prompt}])
+        resp = client.messages.create(model=model, max_tokens=200, messages=[{"role": "user", "content": prompt}])
         raw_text = resp.content[0].text
         try:
-            return json.loads(raw_text)
+            result = json.loads(raw_text)
         except json.JSONDecodeError:
-            return {"_malformed_raw_output": raw_text}
+            return {"_malformed_raw_output": raw_text, "model_used": model}
+        result["model_used"] = model
+        return result
 
     top_case = similar_cases[0] if similar_cases else None
     top_score = top_case["dense_score"] if top_case else 0.0
@@ -341,11 +369,13 @@ def narrative_fraud_specialist_review(claim_id: str, narrative: str, similar_cas
             "finding": "fraud_pattern_match",
             "rationale": f"{top_score:.2f} dense similarity to confirmed case {top_case['id']}.",
             "confidence": round(min(0.5 + 0.48 * top_score, 0.99), 2),
+            "model_used": model,
         }
     return {
         "finding": "clean",
         "rationale": "Low similarity to all known FWA cases.",
         "confidence": 0.92,
+        "model_used": model,
     }
 
 
@@ -387,6 +417,73 @@ def supervisor_synthesize_findings(claim_id: str, billing_finding: dict, narrati
     }
 
 
+def model_gateway_decide(claim_amount: float, rule_flags: list[str], top_similarity: float, narrative: str) -> dict:
+    """
+    THE LLM MODEL GATEWAY. A deterministic, rules-based router -- NOT an
+    LLM call itself, which would defeat the point of saving cost -- that
+    decides which model tier (CHEAP_MODEL vs EXPENSIVE_MODEL) the two
+    specialists reason with for THIS claim.
+
+    The core insight: difficulty to classify correctly is not the same as
+    stakes. A near-exact match to a known fraud case is high-stakes (it
+    gets auto-rejected) but easy to classify -- the similarity score alone
+    all but answers it, so a cheap/fast model is genuinely sufficient. A
+    claim sitting in the ambiguous middle similarity band is where a
+    frontier model's more careful reasoning actually earns its higher cost.
+
+    Signals (each adds to a complexity score; >=3 routes to the expensive
+    tier):
+      - Ambiguous similarity band (0.55-0.90): straddles the narrative
+        specialist's own fraud_pattern_match threshold (0.65) without
+        reaching the gate's near-exact-match region (0.97) -- neither an
+        obviously clean claim nor an obvious near-exact match, the single
+        strongest signal that this claim needs more capable reasoning. (+3)
+      - Rule-based flags already present, i.e. something concrete already
+        looks off and needs to be weighed against the narrative. (+2)
+      - High claim value: a wrong call here costs more, independent of how
+        clear-cut the reasoning looks. (+2)
+      - Long/detailed narrative: more nuance for a model to weigh. (+1)
+
+    This mirrors a real production LLM gateway: route the bulk of easy
+    traffic to a fast/cheap model, reserve the expensive model for the
+    requests that actually need it, rather than paying frontier-model
+    prices for every request regardless of difficulty.
+    """
+    score = 0
+    reasons = []
+
+    if 0.55 <= top_similarity < 0.90:
+        score += 3
+        reasons.append(f"ambiguous similarity band (top_similarity={top_similarity:.2f})")
+
+    if rule_flags:
+        score += 2
+        reasons.append(f"{len(rule_flags)} rule-based flag(s) present")
+
+    if claim_amount > 10000:
+        score += 2
+        reasons.append(f"high claim value (${claim_amount:,.0f})")
+
+    if len(narrative) > 200:
+        score += 1
+        reasons.append("long/detailed narrative")
+
+    if score >= 3:
+        selected_model, tier = EXPENSIVE_MODEL, "expensive"
+    else:
+        selected_model, tier = CHEAP_MODEL, "cheap"
+
+    if not reasons:
+        reasons.append("no complexity signals -- clean, unambiguous claim")
+
+    return {
+        "selected_model": selected_model,
+        "tier": tier,
+        "complexity_score": score,
+        "reasons": reasons,
+    }
+
+
 def evaluator_optimizer_faithfulness_check(rationale: str, guidelines: list[dict], similar_cases: list[dict]) -> dict:
     """
     A second, cheap-tier LLM call that checks the supervisor's synthesized
@@ -407,7 +504,7 @@ def evaluator_optimizer_faithfulness_check(rationale: str, guidelines: list[dict
             '{"faithful": true|false, "reason": "..."}.\n\n'
             f"Retrieved ids: {sorted(retrieved_ids)}\nRationale: {rationale}\n"
         )
-        resp = client.messages.create(model="claude-haiku-4-5", max_tokens=100, messages=[{"role": "user", "content": prompt}])
+        resp = client.messages.create(model=EVALUATOR_MODEL, max_tokens=100, messages=[{"role": "user", "content": prompt}])
         raw_text = resp.content[0].text
         try:
             return json.loads(raw_text)
@@ -489,6 +586,7 @@ class ClaimState(TypedDict):
     similar_cases: list[dict]
     retrieved_guidelines: list[dict]
     rule_fraud_flags: list[str]
+    model_gateway_decision: dict
     billing_finding: dict
     narrative_finding: dict
     llm_output: dict
@@ -623,15 +721,31 @@ def retrieve_guidelines(state: ClaimState) -> dict:
     return {"retrieved_guidelines": guidelines, "log": [f"retrieve_guidelines: retrieved={[g['id'] for g in guidelines]}"]}
 
 
+def model_gateway_route(state: ClaimState) -> dict:
+    print("  -> [model_gateway_route] executing (LLM model gateway: routing by claim complexity)")
+    top_sim = state["similar_cases"][0]["dense_score"] if state["similar_cases"] else 0.0
+    decision = model_gateway_decide(state["claim_amount"], state["rule_fraud_flags"], top_sim, state["narrative"])
+    print(
+        f"     -> routed to {decision['selected_model']} ({decision['tier']} tier, "
+        f"complexity_score={decision['complexity_score']}): {'; '.join(decision['reasons'])}"
+    )
+    return {
+        "model_gateway_decision": decision,
+        "log": [f"model_gateway_route: {decision['tier']} tier -> {decision['selected_model']} (score={decision['complexity_score']})"],
+    }
+
+
 def billing_coding_specialist(state: ClaimState) -> dict:
     print("  -> [billing_coding_specialist] executing (narrow scope: rule flags + guidelines only)")
-    finding = billing_coding_specialist_review(state["claim_id"], state["rule_fraud_flags"], state["retrieved_guidelines"])
+    model = state["model_gateway_decision"]["selected_model"]
+    finding = billing_coding_specialist_review(state["claim_id"], state["rule_fraud_flags"], state["retrieved_guidelines"], model=model)
     return {"billing_finding": finding, "log": [f"billing_coding_specialist: finding={finding}"]}
 
 
 def narrative_fraud_specialist(state: ClaimState) -> dict:
     print("  -> [narrative_fraud_specialist] executing (narrow scope: narrative + FWA matches only)")
-    finding = narrative_fraud_specialist_review(state["claim_id"], state["narrative"], state["similar_cases"])
+    model = state["model_gateway_decision"]["selected_model"]
+    finding = narrative_fraud_specialist_review(state["claim_id"], state["narrative"], state["similar_cases"], model=model)
     return {"narrative_finding": finding, "log": [f"narrative_fraud_specialist: finding={finding}"]}
 
 
@@ -798,6 +912,7 @@ def build_graph(checkpointer):
         ("check_similar_fraud_cases_hybrid", check_similar_fraud_cases_hybrid),
         ("circuit_breaker_escalate", circuit_breaker_escalate),
         ("retrieve_guidelines", retrieve_guidelines),
+        ("model_gateway_route", model_gateway_route),
         ("billing_coding_specialist", billing_coding_specialist),
         ("narrative_fraud_specialist", narrative_fraud_specialist),
         ("supervisor_synthesize", supervisor_synthesize),
@@ -835,11 +950,14 @@ def build_graph(checkpointer):
         },
     )
     g.add_edge("circuit_breaker_escalate", "notify_siu_zapier")
-    # Supervisor-worker fan-out: both specialists run off the same
-    # retrieved guidelines/similar-cases state, each reading only the
-    # slice it needs, then fan back in to the supervisor.
-    g.add_edge("retrieve_guidelines", "billing_coding_specialist")
-    g.add_edge("retrieve_guidelines", "narrative_fraud_specialist")
+    # Model gateway decides the model tier for THIS claim before either
+    # specialist runs, then supervisor-worker fan-out: both specialists run
+    # off the same retrieved guidelines/similar-cases state (and the same
+    # gateway decision), each reading only the slice it needs, then fan
+    # back in to the supervisor.
+    g.add_edge("retrieve_guidelines", "model_gateway_route")
+    g.add_edge("model_gateway_route", "billing_coding_specialist")
+    g.add_edge("model_gateway_route", "narrative_fraud_specialist")
     g.add_edge("billing_coding_specialist", "supervisor_synthesize")
     g.add_edge("narrative_fraud_specialist", "supervisor_synthesize")
     g.add_edge("supervisor_synthesize", "evaluator_optimizer_check")

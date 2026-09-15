@@ -13,10 +13,41 @@ pinned: false
 
 A proof-of-concept agentic workflow for healthcare claims authentication, built on
 [LangGraph](https://github.com/langchain-ai/langgraph). Demonstrates state management,
-conditional routing, checkpoint-based failure recovery, a supervisor delegating to
+conditional routing, checkpoint-based failure recovery, an LLM model gateway that routes
+each claim to a cheap or expensive model tier by complexity, a supervisor delegating to
 specialist sub-agents, an evaluator-optimizer faithfulness check, and a human-in-the-loop
 SIU (Special Investigations Unit) review gate, with optional live integrations to
 Cohere, Pinecone, Anthropic, and Zapier.
+
+## Quick start (every time you restart your laptop)
+
+Everything below is one-time setup — once `venv/` exists with dependencies installed,
+this is the only sequence you need after a reboot. Run it in your own Terminal, not
+through any other tool, since the Gradio server has to keep running in that window.
+
+```bash
+cd ~/Desktop/code/healthcare-claims-authentication
+rm -f claims_demo_checkpoints.sqlite* embedding_cache.sqlite*   # optional: start with a clean demo state
+venv/bin/python app.py
+```
+
+Wait a few seconds for:
+
+```
+Running on local URL:  http://127.0.0.1:7860
+Running on public URL: https://xxxxxxxxxxxxxxxxxx.gradio.live
+```
+
+Open the local URL yourself, or share the `.gradio.live` one. `Ctrl+C` in that terminal
+stops the server; the public link dies with it (and expires on its own after 72 hours
+regardless), so re-run `venv/bin/python app.py` for a fresh one before your next demo.
+
+Calling the venv's `python` binary directly (rather than `source venv/bin/activate` first)
+sidesteps any conda/PATH conflicts if you also have Anaconda installed — see
+"Troubleshooting" below if you ever see `ModuleNotFoundError: No module named 'gradio'`.
+
+True auto-start-on-login (no manual command at all) is possible via a macOS LaunchAgent,
+but isn't set up here — ask if you want that instead of the one-liner above.
 
 ## Business Case (STAR)
 
@@ -97,7 +128,8 @@ implement encryption, BAAs with vendors, or access logging.
 ![Healthcare Claims Authentication architecture diagram](architecture_diagram_final.png)
 
 This matches `claims_auth_hybrid_rag_confidence_circuitbreaker.py`'s graph node-for-node:
-identity/coverage checks → input guardrail → hybrid retrieval → the billing/narrative
+identity/coverage checks → input guardrail → hybrid retrieval → **LLM model gateway**
+(routes this claim to a cheap or expensive model tier by complexity) → the billing/narrative
 specialists and supervisor synthesis → evaluator-optimizer faithfulness check → output
 guardrail → confidence gate → auto-approve / auto-reject / human SIU review. See the
 [Agentic AI Pattern Mapping](#agentic-ai-pattern-mapping) section below for how each part
@@ -111,7 +143,7 @@ maps to standard agentic-AI terminology.
 | `claims_auth_basic.py` | The healthcare claims authentication graph (patient identity → coverage → fraud/abuse → approve/SIU review) with a human-in-the-loop interrupt, using purely mock/rule-based fraud detection. No external services required. |
 | `claims_auth_with_cohere_pinecone_zapier.py` | Adds Cohere embeddings of the claim narrative, a Pinecone similarity search against known fraud/waste/abuse (FWA) cases, and a Zapier webhook notification when a claim is flagged. |
 | `claims_auth_full_with_llm_guardrails_cache.py` | Adds an LLM reasoning call (Anthropic), an input guardrail (blocks prompt-injection / unredacted-PHI narratives before anything is sent externally), an output guardrail (validates the LLM's response and fails closed to human review if it can't be trusted), and a persistent SQLite cache for embeddings so a repeated narrative never re-pays for a Cohere call. |
-| `claims_auth_hybrid_rag_confidence_circuitbreaker.py` | **Primary deliverable.** Adds hybrid retrieval (dense + real BM25 keyword search, fused), true RAG grounding (retrieved guideline text goes directly into the prompt, not just a bare similarity score), a **supervisor delegating to two specialist sub-agents** (`billing_coding_specialist`, `narrative_fraud_specialist`) that run in parallel and get synthesized by `supervisor_synthesize`, an **evaluator-optimizer faithfulness check** (`evaluator_optimizer_check`) that can force one bounded re-synthesis if the rationale cites something that wasn't actually retrieved, a confidence-driven three-way decision gate (auto-approve / auto-reject / human review), and a circuit breaker distinct from the guardrails (tracks repeated tool failures and escalates rather than retrying indefinitely or guessing on incomplete data). |
+| `claims_auth_hybrid_rag_confidence_circuitbreaker.py` | **Primary deliverable.** Adds hybrid retrieval (dense + real BM25 keyword search, fused), true RAG grounding (retrieved guideline text goes directly into the prompt, not just a bare similarity score), an **LLM model gateway** (`model_gateway_route` / `model_gateway_decide`) that routes each claim to a cheap or expensive model tier by a deterministic complexity score, a **supervisor delegating to two specialist sub-agents** (`billing_coding_specialist`, `narrative_fraud_specialist`) that run in parallel using the gateway's chosen model and get synthesized by `supervisor_synthesize`, an **evaluator-optimizer faithfulness check** (`evaluator_optimizer_check`) that can force one bounded re-synthesis if the rationale cites something that wasn't actually retrieved, a confidence-driven three-way decision gate (auto-approve / auto-reject / human review), and a circuit breaker distinct from the guardrails (tracks repeated tool failures and escalates rather than retrying indefinitely or guessing on incomplete data). |
 | `large_document_chunking_hybrid_retrieval.py` | Standalone RAG-mechanics demo, separate from the claims graph's `ClaimState`: structure-aware document chunking (splits on numbered-rule boundaries rather than fixed word counts) and two hybrid-fusion strategies (weighted min-max sum and Reciprocal Rank Fusion) compared side by side. Read this if you want the retrieval mechanics in isolation before seeing them embedded in the main claims graph. |
 | `architecture_diagram_final.png` | Final architecture diagram — matches `claims_auth_hybrid_rag_confidence_circuitbreaker.py`'s graph exactly (node names, routing, and the circuit breaker/guardrail split). Earlier intermediate-scope diagrams have been removed now that the code has moved past them; see `git log` if you need one. |
 | `Claims_Authentication_E2E_Architecture (5).md` | The comprehensive production-scope architecture narrative (gateway, multi-tenancy, PII tokenization, evaluation, deployment) — the elements *not* in the POC scripts, mapped back to which script proves which piece. |
@@ -146,7 +178,7 @@ agent's flexibility (Section 1.1).
 
 | Component | This project |
 |---|---|
-| Model | Claude (`LLM_MODEL`, Sonnet-tier) for reasoning; a cheaper Haiku tier specifically for `evaluator_optimizer_check`'s faithfulness check |
+| Model | Claude, via an **LLM model gateway** (`model_gateway_route`) that routes each claim to `CHEAP_MODEL` (Haiku) or `EXPENSIVE_MODEL` (Sonnet) by a deterministic complexity score computed before the specialists run — not a single fixed model for every request. `EVALUATOR_MODEL` (also Haiku) is fixed separately for `evaluator_optimizer_check`'s faithfulness check, which is narrow and mechanical regardless of the claim's difficulty |
 | Tools / Actions | `cohere_embed`, `pinecone_query_hybrid`, `zapier_notify` — direct SDK calls today, not yet MCP servers (Section 6 gap, below) |
 | Memory | `ClaimState` checkpointed per `thread_id` (short-term); SQLite embedding cache; long-term claim history + FWA vector store are designed in the E2E architecture doc but not in these POC scripts |
 | Orchestrator | LangGraph `StateGraph` — explicit nodes + conditional edges, not an LLM-driven loop |
@@ -206,7 +238,7 @@ cites "hybrid-retrieval, confidence-gated designs for domains like claims authen
 
 | Sub-pattern | Status |
 |---|---|
-| Router / Planner | Partial — the low-risk pre-filter that would route claims around retrieval entirely is designed, not in POC; retrieval strategy itself is fixed (always hybrid), not chosen per-query |
+| Router / Planner | Partial — retrieval strategy itself is fixed (always hybrid), not chosen per-query; the low-risk pre-filter that would route claims around retrieval entirely is designed, not in POC. The model-tier router (Section 2/9.3) is implemented, but that routes which *model* reasons, not which *retrieval path* runs |
 | Hybrid retrieval | Implemented — `_hybrid_rank` fuses dense (Cohere/Pinecone) + BM25; `large_document_chunking_hybrid_retrieval.py` also compares weighted-fusion vs. Reciprocal Rank Fusion side by side |
 | Reranking | **Not implemented** — no cross-encoder reranking step; ranking is the fusion score alone. Real gap. |
 | Confidence gate | Implemented — `confidence_decision_gate` |
@@ -225,11 +257,15 @@ checkpointing + `interrupt_before` for pausing on human review" is exactly what
   LLM-as-judge. Golden-dataset regression testing and trace-based observability
   (LangSmith/Langfuse/Arize) are **not** implemented — the manual "Testing checklist"
   above is the closest substitute today.
-- **Cost & latency (9.3) — partial.** Caching is implemented (embedding cache); the
-  specialist fan-out is a real instance of parallel tool calls (9.3's "batching"). Model
-  routing by task difficulty is designed (gateway tier policy) but only lightly present
-  in the POC — the evaluator's Haiku-tier call is the one working example of routing to
-  a cheaper model.
+- **Cost & latency (9.3) — mostly implemented.** Caching is implemented (embedding
+  cache); the specialist fan-out is a real instance of parallel tool calls (9.3's
+  "batching"); and model routing by task difficulty is now a genuine per-claim decision —
+  `model_gateway_route` scores each claim's complexity (ambiguous similarity band, rule
+  flags, claim value, narrative length) and picks `CHEAP_MODEL` or `EXPENSIVE_MODEL`
+  *before* the specialists run, not a single fixed model for every request. What's still
+  missing against a full production gateway: no fallback/retry across providers, no
+  rate-limiting or spend caps, and the routing itself is rules-based rather than a learned
+  or LLM-scored router.
 
 ## Prerequisites
 
@@ -316,24 +352,33 @@ local SQLite checkpoint file — safe to delete between runs if you want a clean
 
 **`claims_auth_hybrid_rag_confidence_circuitbreaker.py`**
 - Claim J (clean narrative): hybrid dense+BM25 retrieval finds low genuine
-  similarity to any known FWA case; both specialists report clean/consistent, the
-  supervisor synthesizes `approve` at high confidence, the evaluator-optimizer
-  confirms the rationale is grounded → auto-approved, no human involved.
+  similarity to any known FWA case. **Model gateway routes to the cheap tier**
+  (Haiku) — no complexity signals, an easy call — both specialists report
+  clean/consistent, the supervisor synthesizes `approve` at high confidence, the
+  evaluator-optimizer confirms the rationale is grounded → auto-approved, no
+  human involved.
 - Claim K (Pinecone permanently failing for this claim): `check_similar_fraud_cases_hybrid`
   retries once, fails again, and the circuit breaker trips after `MAX_TOOL_ERRORS`
   (2) — the claim is escalated straight to human SIU review without ever
-  reaching either specialist or the supervisor, since there's no reliable data
-  to reason over.
+  reaching retrieval, the model gateway, either specialist, or the supervisor,
+  since there's no reliable data to reason over.
 - Claim L (narrative is a near-exact match to a known FWA case): dense
-  similarity ≈1.0, the narrative specialist flags a fraud-pattern match, the
-  supervisor synthesizes `flag_for_siu` at very high confidence, the evaluator
-  confirms it cites a real retrieved case ID, and the confidence-decision-gate
+  similarity ≈1.0. **Model gateway routes to the cheap tier** (Haiku) —
+  counterintuitively, since this is the highest-stakes outcome (auto-rejected),
+  but a near-exact match is an *easy* claim to classify correctly, so the
+  gateway doesn't spend on the expensive tier just because the stakes are
+  high. The narrative specialist flags a fraud-pattern match, the supervisor
+  synthesizes `flag_for_siu` at very high confidence, the evaluator confirms
+  it cites a real retrieved case ID, and the confidence-decision-gate
   auto-rejects the claim outright — no pause, no human gate, fully automated
   (with a Zapier notification sent purely for audit purposes).
 - Claim M (ambiguous narrative — partial documentation of an upcoded visit):
   dense similarity ≈0.80, high enough to flag but not high enough to
-  auto-reject — this lands in the "uncertain middle" and is routed to a
-  human SIU reviewer, exactly where a human adds the most value.
+  auto-reject. **Model gateway routes to the expensive tier** (Sonnet) — this
+  similarity score sits squarely in the ambiguous band the gateway is designed
+  to catch, so it's worth paying for more capable reasoning here. This lands
+  in the "uncertain middle" and is routed to a human SIU reviewer, exactly
+  where a human adds the most value.
 
 **`large_document_chunking_hybrid_retrieval.py`**
 - Compares `naive_fixed_chunk` (splits every N words, can cut a numbered rule in
@@ -431,11 +476,14 @@ If you do want to run against real services:
 6. **Zapier**: create a Zap with a "Catch Hook" trigger step, copy its unique webhook
    URL into `ZAPIER_WEBHOOK_URL`. What happens downstream of that hook (Slack message,
    email, ticket creation) is configured entirely in Zapier's UI, not in this code.
-7. **Anthropic**: set `ANTHROPIC_API_KEY`. `LLM_MODEL` is set to `"claude-sonnet-5"`
-   near the top of each script that calls it — change it if you want a different
-   model. In `claims_auth_hybrid_rag_confidence_circuitbreaker.py`, the
-   evaluator-optimizer specifically calls a cheaper tier (`claude-haiku-4-5`) for
-   its faithfulness check, separate from `LLM_MODEL`.
+7. **Anthropic**: set `ANTHROPIC_API_KEY`. In `claims_auth_hybrid_rag_confidence_circuitbreaker.py`,
+   `CHEAP_MODEL` (`"claude-haiku-4-5"`) and `EXPENSIVE_MODEL` (`"claude-sonnet-5"`) near the top of
+   the file are the two tiers the **LLM model gateway** (`model_gateway_route`) routes each claim
+   between by complexity — change either constant if you want different models for that tier.
+   `EVALUATOR_MODEL` (also Haiku) is fixed separately for `evaluator_optimizer_check`'s
+   faithfulness check, since that check is narrow and mechanical regardless of the claim's
+   difficulty. The gateway's routing logic itself (`model_gateway_decide`) is plain code, not an
+   LLM call, in both mock and live mode.
 8. **BM25**: no setup needed even in live mode — `rank_bm25` runs entirely
    locally against the same mock FWA-case and guideline text used in mock mode. If you
    want it to run against your real corpus in live mode, replace the `_FWA_CASES` and
@@ -464,15 +512,19 @@ Run through these to confirm the POC behaves as documented:
       `llm_output`, the output guardrail passing, and a pause for SIU review
 - [ ] `claims_auth_full_with_llm_guardrails_cache.py` Claim I is rejected by the **input** guardrail,
       and the printed trace confirms `check_narrative_embedding` and `llm_fraud_reasoning` never ran
-- [ ] `claims_auth_hybrid_rag_confidence_circuitbreaker.py` Claim J shows both
-      `billing_coding_specialist` and `narrative_fraud_specialist` executing, the evaluator-optimizer
-      reporting `faithful=True`, and an auto-approve
+- [ ] `claims_auth_hybrid_rag_confidence_circuitbreaker.py` Claim J shows `model_gateway_route`
+      choosing `claude-haiku-4-5` (cheap tier, complexity_score=0), both `billing_coding_specialist`
+      and `narrative_fraud_specialist` executing, the evaluator-optimizer reporting `faithful=True`,
+      and an auto-approve
 - [ ] `claims_auth_hybrid_rag_confidence_circuitbreaker.py` Claim K shows two failed retry attempts,
       then `circuit_breaker_escalate` firing, then a pause for SIU review — and the trace confirms
-      neither specialist nor `supervisor_synthesize` ran for this claim
-- [ ] `claims_auth_hybrid_rag_confidence_circuitbreaker.py` Claim L shows `dense_score` near 1.0 and
-      finalizes as `REJECTED` with **no** pause and **no** `route_to_siu_review` — a fully automated decision
-- [ ] `claims_auth_hybrid_rag_confidence_circuitbreaker.py` Claim M shows a mid-range `dense_score`
+      the model gateway, neither specialist, nor `supervisor_synthesize` ran for this claim
+- [ ] `claims_auth_hybrid_rag_confidence_circuitbreaker.py` Claim L shows `model_gateway_route`
+      choosing `claude-haiku-4-5` (cheap tier — a near-exact match is easy to classify despite the
+      high stakes) and `dense_score` near 1.0, finalizing as `REJECTED` with **no** pause and **no**
+      `route_to_siu_review` — a fully automated decision
+- [ ] `claims_auth_hybrid_rag_confidence_circuitbreaker.py` Claim M shows `model_gateway_route`
+      choosing `claude-sonnet-5` (expensive tier — the ambiguous similarity band) and a mid-range `dense_score`
       (roughly 0.7-0.9), a `flag_for_siu` recommendation below the auto-reject confidence bar, and a
       genuine pause for human review
 - [ ] Deleting the `.sqlite` checkpoint files between runs produces identical output
@@ -485,7 +537,7 @@ Run through these to confirm the POC behaves as documented:
 
 | Symptom | Likely cause |
 |---|---|
-| `ModuleNotFoundError: No module named 'langgraph'` | Virtual environment not activated, or `pip install -r requirements.txt` not run |
+| `ModuleNotFoundError: No module named 'langgraph'` (or `'gradio'`) | Virtual environment not activated, or `pip install -r requirements.txt` not run. If you *did* activate it and still see this, run `conda deactivate` first (if you also have Anaconda/Miniconda installed) and/or call the interpreter directly — `venv/bin/python app.py` — instead of relying on plain `python` on PATH, since conda's `base` environment can shadow the venv's `python` |
 | `pinecone-client` install error / deprecation exception on import | Use the `pinecone` package, not `pinecone-client` — this repo's `requirements.txt` already specifies the correct one |
 | Graph "resumes" but re-runs everything from scratch | You changed the `thread_id` between calls, or deleted the `.sqlite` file — the checkpointer has no history for a new thread |
 | `graph.invoke(None, config)` raises `KeyError` on thread | You must call the graph at least once with real input for a given `thread_id` before you can resume it with `None` |

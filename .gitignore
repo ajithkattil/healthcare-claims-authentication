@@ -8,3 +8,4 @@ __pycache__/
 venv/
 *.sqlite-shm
 *.sqlite-wal
+.gradio/

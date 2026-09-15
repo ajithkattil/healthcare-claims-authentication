@@ -101,6 +101,12 @@ def _format_trace(state: dict) -> str:
 
 def _format_details(state: dict) -> str:
     parts = []
+    if state.get("model_gateway_decision"):
+        d = state["model_gateway_decision"]
+        parts.append(
+            f"Model gateway: routed to {d['selected_model']} ({d['tier']} tier, "
+            f"complexity_score={d['complexity_score']}) -- {'; '.join(d['reasons'])}"
+        )
     if state.get("billing_finding"):
         parts.append(f"Billing/coding specialist: {state['billing_finding']}")
     if state.get("narrative_finding"):
@@ -227,4 +233,4 @@ with gr.Blocks(title="Healthcare Claims Authentication POC") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(share=True)
+    demo.launch()
