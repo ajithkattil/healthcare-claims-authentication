@@ -27,7 +27,7 @@ through any other tool, since the Gradio server has to keep running in that wind
 
 ```bash
 cd ~/Desktop/code/healthcare-claims-authentication
-rm -f claims_demo_checkpoints.sqlite* embedding_cache.sqlite*   # optional: start with a clean demo state
+rm -f claims_demo_checkpoints.sqlite* embedding_cache.sqlite*   # optional: start with a clean state
 venv/bin/python app.py
 ```
 
@@ -40,7 +40,7 @@ Running on public URL: https://xxxxxxxxxxxxxxxxxx.gradio.live
 
 Open the local URL yourself, or share the `.gradio.live` one. `Ctrl+C` in that terminal
 stops the server; the public link dies with it (and expires on its own after 72 hours
-regardless), so re-run `venv/bin/python app.py` for a fresh one before your next demo.
+regardless), so re-run `venv/bin/python app.py` for a fresh one whenever you need it again.
 
 Calling the venv's `python` binary directly (rather than `source venv/bin/activate` first)
 sidesteps any conda/PATH conflicts if you also have Anaconda installed — see
@@ -65,7 +65,8 @@ a proper platform, not a chatbot.
 through the retrieval infrastructure and the observability stack — under real
 constraints: it has to work across different client data environments, meet enterprise
 data-security requirements, support multiple tenants, and be something a team can
-maintain, measure, and improve once it's live, not just something that works in a demo.
+maintain, measure, and improve once it's live, not just something that happens to work
+once under a single controlled run.
 
 **Action.**
 - **Agent orchestration** — a LangGraph-based orchestration layer with Claude as the
@@ -125,7 +126,7 @@ PII protection isn't one control, it's four separate layers, each catching a dif
 failure mode. It's worth being precise about which layer is actually implemented in this
 POC's code today vs. designed on paper vs. a different concern entirely (build-time
 hygiene, not runtime protection) — conflating them is the easiest way to give a vague
-answer to a direct interview question.
+answer to a direct question about how PII is actually handled here.
 
 1. **Perimeter tokenization (designed, not in POC).** Structured PII fields — patient ID,
    provider ID — get tokenized at the API gateway, before a claim ever reaches the graph,
@@ -180,7 +181,7 @@ context window, which is the honest gap to name if pushed on this.
    single chunk that this wouldn't catch. `large_document_chunking_hybrid_retrieval.py` is
    designed to close exactly this gap — structure-aware chunking splits long documents into
    small, rule-boundary-respecting pieces before they'd ever reach this point — but it's a
-   standalone demo today, not wired into the main graph's retrieval.
+   standalone script today, not wired into the main graph's retrieval.
 3. **Output side — the LLM's own response.** Two mechanisms: `max_tokens=200`
    (specialists) and `max_tokens=100` (evaluator) cap how much the model is *allowed to
    generate* in live mode. Separately, `run_output_guardrail` validates
@@ -237,7 +238,7 @@ roughly 25 functions that make up the actual business logic — every guardrail,
 retrieval, both specialists, the supervisor, the evaluator-optimizer, the model gateway,
 the confidence gate, approve/reject — **exactly one** touches a LangGraph-specific object
 (`check_similar_fraud_cases_hybrid` reads `config["configurable"]["thread_id"]`, only to
-drive the circuit-breaker demo trigger), and **one** field in `ClaimState`
+drive the circuit-breaker's simulated-outage trigger), and **one** field in `ClaimState`
 (`log: Annotated[list[str], operator.add]`) uses a LangGraph-specific reducer annotation.
 Everything else is a plain function: takes a dict, reads some keys, returns a dict of
 updates, zero `langgraph` imports. That part is already portable — moving it to a
@@ -284,9 +285,66 @@ a Pydantic model; (2) port each LangGraph node to a `Flow` method — mostly mec
 find/replace `return {...}` with `self.state.field = ...`; (3) replace each
 `add_conditional_edges` mapping with an `@router()`/`@listen()` pair; (4) replace
 `SqliteSaver` + `interrupt_before` with `@persist` + `@human_feedback`; (5) re-run the four
-demo scenarios (clean / circuit-breaker / near-exact-match / ambiguous) and confirm
+preset claim scenarios (clean / circuit-breaker / near-exact-match / ambiguous) and confirm
 identical decisions — the actual regression test that the port didn't change behavior, not
 just that it compiles.
+
+## Scaling to Production Volume
+
+The honest answer to "what happens if 50,000 claims arrive together" starts with a
+failure order, not a single throughput number, because the current code has three
+concrete bottlenecks it was never built past.
+
+**What breaks first, in order.**
+
+1. **The two SQLite files.** The checkpointer (`claims_demo_checkpoints.sqlite` in
+   `app.py`, `claims_v4_checkpoints.sqlite` when run standalone) and the embedding cache
+   (`embedding_cache.sqlite`) both allow exactly one writer at a time. Even in WAL mode,
+   concurrent writers queue and start timing out well before 50,000 concurrent claims —
+   realistically in the low hundreds, depending on how often each claim writes state.
+   This surfaces as SQLite lock/timeout exceptions out of `graph.invoke()`.
+2. **The single Python process.** `app.py` runs one process with no worker pool;
+   `graph.invoke()` is a synchronous call, so the number of claims genuinely in flight at
+   once is bounded by what one process can hold, nowhere close to 50,000.
+3. **External API rate limits (live mode only).** 50,000 claims fanning out to roughly
+   one embed call plus one-to-three LLM calls each (both specialists, plus the
+   evaluator's single allowed regeneration) is on the order of 100,000+ external calls —
+   enough to hit Anthropic/Cohere/Pinecone rate limits almost immediately outside an
+   enterprise contract. The existing circuit breaker (`MAX_TOOL_ERRORS`) is scoped to
+   hard tool failures on the retrieval node; it has no backoff logic for LLM 429
+   responses, a distinct failure mode.
+
+**What a production build would change**, mapped to concrete infrastructure rather than
+left abstract:
+
+- **Checkpointer and cache** — `SqliteSaver` moves to LangGraph's Postgres-backed
+  checkpointer against a managed database, and the embedding cache moves to Redis or a
+  shared Postgres table. This isn't only a throughput fix: a single SQLite file can't be
+  shared across multiple running instances of the process at all, so scaling out
+  horizontally today would silently give each instance its own disconnected copy of
+  every claim's state — a correctness bug, not just a performance one.
+- **Compute topology** — graph execution moves out of the UI's request path and runs as
+  a stateless worker process behind a queue (e.g. SQS, or an existing message broker),
+  scaled by a horizontal autoscaler reacting to queue depth rather than one long-lived
+  process. The queue is what actually absorbs a burst of 50,000 claims arriving
+  together; workers drain it at a sustainable rate instead of every claim trying to run
+  synchronously and immediately.
+- **Rate limiting and backpressure** — a token-bucket limiter per external provider
+  (Anthropic, Cohere, Pinecone) so workers self-throttle to each provider's real
+  RPM/TPM ceiling, paired with exponential backoff and jitter specifically for 429
+  responses — complementary to, not a replacement for, the existing circuit breaker.
+- **Idempotency** — once claims flow through a queue with retries, processing needs to
+  be idempotent on `claim_id`, since a retried message re-running the graph from the
+  wrong point would double-process a claim. The current code has no such guarantee.
+- **Observability** — the per-node `log` trace this POC already prints becomes the basis
+  for structured per-node latency and error-rate metrics once it's emitted somewhere
+  other than stdout — what actually answers "where is the backlog" during a real burst.
+
+**Cost, not just throughput.** The model gateway's underlying purpose is exactly this
+scenario: if real-world claim complexity resembles the split across the four preset
+scenarios (roughly split cheap/expensive, not uniformly expensive), 50,000 claims land
+well below the cost of routing every claim to the expensive tier — the concrete business
+case for the gateway existing at all, and worth having a number ready to back up.
 
 ## Architecture
 
@@ -304,18 +362,18 @@ maps to standard agentic-AI terminology.
 
 | File | Purpose |
 |---|---|
-| `concepts_demo_failure_recovery.py` | Standalone LangGraph concepts demo (a small patient-record intake pipeline): state, conditional edges, and — the core mechanic — proving that a re-invoked graph resumes only the failed node, not the whole run. Not claims-specific; read this first if you're new to LangGraph. |
+| `concepts_demo_failure_recovery.py` | Standalone LangGraph concepts walkthrough (a small patient-record intake pipeline): state, conditional edges, and — the core mechanic — proving that a re-invoked graph resumes only the failed node, not the whole run. Not claims-specific; read this first if you're new to LangGraph. |
 | `claims_auth_basic.py` | The healthcare claims authentication graph (patient identity → coverage → fraud/abuse → approve/SIU review) with a human-in-the-loop interrupt, using purely mock/rule-based fraud detection. No external services required. |
 | `claims_auth_with_cohere_pinecone_zapier.py` | Adds Cohere embeddings of the claim narrative, a Pinecone similarity search against known fraud/waste/abuse (FWA) cases, and a Zapier webhook notification when a claim is flagged. |
 | `claims_auth_full_with_llm_guardrails_cache.py` | Adds an LLM reasoning call (Anthropic), an input guardrail (blocks prompt-injection / unredacted-PHI narratives before anything is sent externally), an output guardrail (validates the LLM's response and fails closed to human review if it can't be trusted), and a persistent SQLite cache for embeddings so a repeated narrative never re-pays for a Cohere call. |
 | `claims_auth_hybrid_rag_confidence_circuitbreaker.py` | **Primary deliverable.** Adds hybrid retrieval (dense + real BM25 keyword search, fused), true RAG grounding (retrieved guideline text goes directly into the prompt, not just a bare similarity score), an **LLM model gateway** (`model_gateway_route` / `model_gateway_decide`) that routes each claim to a cheap or expensive model tier by a deterministic complexity score, a **supervisor delegating to two specialist sub-agents** (`billing_coding_specialist`, `narrative_fraud_specialist`) that run in parallel using the gateway's chosen model and get synthesized by `supervisor_synthesize`, an **evaluator-optimizer faithfulness check** (`evaluator_optimizer_check`) that can force one bounded re-synthesis if the rationale cites something that wasn't actually retrieved, a confidence-driven three-way decision gate (auto-approve / auto-reject / human review), and a circuit breaker distinct from the guardrails (tracks repeated tool failures and escalates rather than retrying indefinitely or guessing on incomplete data). |
-| `large_document_chunking_hybrid_retrieval.py` | Standalone RAG-mechanics demo, separate from the claims graph's `ClaimState`: structure-aware document chunking (splits on numbered-rule boundaries rather than fixed word counts) and two hybrid-fusion strategies (weighted min-max sum and Reciprocal Rank Fusion) compared side by side. Read this if you want the retrieval mechanics in isolation before seeing them embedded in the main claims graph. |
+| `large_document_chunking_hybrid_retrieval.py` | Standalone RAG-mechanics script, separate from the claims graph's `ClaimState`: structure-aware document chunking (splits on numbered-rule boundaries rather than fixed word counts) and two hybrid-fusion strategies (weighted min-max sum and Reciprocal Rank Fusion) compared side by side. Read this if you want the retrieval mechanics in isolation before seeing them embedded in the main claims graph. |
 | `architecture_diagram_final.png` | Final architecture diagram — matches `claims_auth_hybrid_rag_confidence_circuitbreaker.py`'s graph exactly (node names, routing, and the circuit breaker/guardrail split). Earlier intermediate-scope diagrams have been removed now that the code has moved past them; see `git log` if you need one. |
 | `Claims_Authentication_E2E_Architecture (5).md` | The comprehensive production-scope architecture narrative (gateway, multi-tenancy, PII tokenization, evaluation, deployment) — the elements *not* in the POC scripts, mapped back to which script proves which piece. |
 | `agentic_patterns_review.md` | How this project maps to 2026 agentic-AI patterns (routing, supervisor-worker, evaluator-optimizer, OWASP Agentic Top 10) and what's still roadmap vs. actually built. |
 | `production_additions_explainer.md` | Implementation notes for the seven production-only elements from the architecture doc that aren't in the POC scripts (gateway/auth, tenancy, tokenization, pre-filter, long-term memory, prompt versioning, RAGAS/DeepEval). |
 | `Claude outputs/claims-final-architecture.md` | Source markdown for the "final architecture v2" reference doc spanning all three design passes (POC, production-hardening, 2026 agentic patterns). |
-| `app.py` | Gradio web UI wrapping the primary graph for a shareable demo (preset + custom mock claims, interactive human-in-the-loop review). Deploy target: Hugging Face Spaces — see "Sharing this demo" below. |
+| `app.py` | Gradio web UI wrapping the primary graph for interactive, shareable use (preset + custom mock claims, interactive human-in-the-loop review). Deploy target: Hugging Face Spaces — see "Sharing this app" below. |
 | `requirements.txt` | Python dependencies, including the Anthropic SDK, `rank_bm25`, and `gradio`. |
 | `.env.example` | Template for API keys, only needed if you flip to live mode. |
 
@@ -552,7 +610,7 @@ local SQLite checkpoint file — safe to delete between runs if you want a clean
   `reciprocal_rank_fusion` on the same query, printing both rankings so you can
   see where they agree and where they don't.
 
-## Sharing this demo (Hugging Face Spaces)
+## Sharing this app (Hugging Face Spaces)
 
 `app.py` wraps `claims_auth_hybrid_rag_confidence_circuitbreaker.py`'s graph in a
 small [Gradio](https://gradio.app) UI: pick one of four preset mock claims (or type
@@ -593,7 +651,7 @@ Gradio prints a local URL (`http://127.0.0.1:7860`) — open it in a browser.
 4. The Space builds automatically (installs `requirements.txt`, then runs `app.py`
    because of `app_file: app.py` in the YAML block) and gives you a public URL like
    `https://huggingface.co/spaces/<your-username>/<space-name>` to share.
-5. To update the demo later, just push again: `git push space main`.
+5. To update the app later, just push again: `git push space main`.
 
 Keeping the public Space in mock mode is the right default — no API keys ever touch
 a public server, and every preset claim is fully synthetic. If you later want a
@@ -721,7 +779,8 @@ Run through these to confirm the POC behaves as documented:
 - Length limits throughout are character-count proxies, not actual token-counting against
   a model's context window (see [String/Context Length Management](#stringcontext-length-management))
 - SQLite checkpointing is fine for a single-process POC; a concurrent production
-  deployment should move to a Postgres-backed checkpointer
+  deployment should move to a Postgres-backed checkpointer (see
+  [Scaling to Production Volume](#scaling-to-production-volume))
 - The Zapier notification call is not idempotent — a checkpoint replay after a crash
   immediately following a successful Zapier call could send a duplicate notification
 - The output guardrail's checks are intentionally simple (schema, allowed values,
