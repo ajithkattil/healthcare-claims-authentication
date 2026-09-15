@@ -12,6 +12,17 @@ the docstring in each script for what a real deployment would need to add before
 touching actual Protected Health Information (PHI) under HIPAA — this POC does not
 implement encryption, BAAs with vendors, or access logging.
 
+## Architecture
+
+![Healthcare Claims Authentication architecture diagram](architecture_diagram_final.png)
+
+This matches `claims_auth_hybrid_rag_confidence_circuitbreaker.py`'s graph node-for-node:
+identity/coverage checks → input guardrail → hybrid retrieval → the billing/narrative
+specialists and supervisor synthesis → evaluator-optimizer faithfulness check → output
+guardrail → confidence gate → auto-approve / auto-reject / human SIU review. See the
+[Agentic AI Pattern Mapping](#agentic-ai-pattern-mapping) section below for how each part
+maps to standard agentic-AI terminology.
+
 ## Files in this project
 
 | File | Purpose |
