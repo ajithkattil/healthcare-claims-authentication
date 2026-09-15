@@ -139,7 +139,7 @@ reaches `thread_id` without it needing to be part of the state schema itself. Th
 block then does this, with a real `SqliteSaver` checkpointer:
 
 ```python
-result = graph.invoke({"log": []}, config=config)   # raises, caught, printed
+result = graph.invoke({"log": []}, config=config)   # raises, caught,  printed
 snapshot = graph.get_state(config)                    # shows what's saved and what's next
 result = graph.invoke(None, config=config)            # RESUMES — no re-run of earlier nodes
 ```
