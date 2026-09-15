@@ -166,6 +166,41 @@ data; the tokenization perimeter and RBAC-gated resolution are designed but not 
 and scoped out of this POC deliberately alongside multi-tenancy and the API gateway they
 depend on (see `production_additions_explainer.md`).
 
+## String/Context Length Management
+
+Three separate control points bound how much text moves through the graph, each catching
+a different part of the pipeline — none of them is actual token-counting against a model's
+context window, which is the honest gap to name if pushed on this.
+
+1. **Input side — the narrative itself.** `run_input_guardrail` rejects the claim outright
+   if `len(narrative) > 2000` characters (or empty), before anything gets embedded or sent
+   to an LLM. This is the one hard cap on the largest piece of free text entering the graph.
+2. **Retrieval side — count, not length.** `retrieve_guidelines_hybrid` and the FWA-case
+   search both call `_hybrid_rank(..., top_k=2)`, so at most 2 guideline chunks and 2
+   similar cases ever get concatenated into a specialist's prompt (`guideline_block`,
+   `similar_block`). That bounds *how many* documents get pulled in, not *how long each one
+   is* — fine here because `_GUIDELINES` and `_FWA_CASES` are hardcoded short mock strings,
+   but a real guideline corpus with long documents could produce an arbitrarily large
+   single chunk that this wouldn't catch. `large_document_chunking_hybrid_retrieval.py` is
+   designed to close exactly this gap — structure-aware chunking splits long documents into
+   small, rule-boundary-respecting pieces before they'd ever reach this point — but it's a
+   standalone demo today, not wired into the main graph's retrieval.
+3. **Output side — the LLM's own response.** Two mechanisms: `max_tokens=200`
+   (specialists) and `max_tokens=100` (evaluator) cap how much the model is *allowed to
+   generate* in live mode. Separately, `run_output_guardrail` validates
+   `0 < len(rationale) <= 500` *after* generation — an implausibly long rationale fails the
+   guardrail and the claim falls closed to human review, rather than being silently
+   truncated. That's deliberate: truncating a model's reasoning and continuing risks losing
+   the caveat that mattered; failing closed and routing to a human doesn't.
+
+**What's missing for production scale:** all three caps above are character-count proxies
+sized generously for a single claim's narrative and a short rationale, not a computed token
+budget across the whole assembled prompt (narrative + rule flags + guideline block +
+similar-case block). For four hardcoded mock strings that's a non-issue; for a real corpus
+you'd want the chunking script's approach wired into retrieval, plus a `tiktoken`-based
+prompt-budget check before each `messages.create` call, rather than relying on the pieces
+staying small by construction.
+
 ## Architecture
 
 ![Healthcare Claims Authentication architecture diagram](architecture_diagram_final.png)
@@ -596,6 +631,8 @@ Run through these to confirm the POC behaves as documented:
   reasoning — none of these are a trained fraud model
 - No authentication, encryption, or PHI-handling hardening — do not point this at
   real patient/claim data as-is (see the [PII/PHI Handling](#piiphi-handling) section above)
+- Length limits throughout are character-count proxies, not actual token-counting against
+  a model's context window (see [String/Context Length Management](#stringcontext-length-management))
 - SQLite checkpointing is fine for a single-process POC; a concurrent production
   deployment should move to a Postgres-backed checkpointer
 - The Zapier notification call is not idempotent — a checkpoint replay after a crash
