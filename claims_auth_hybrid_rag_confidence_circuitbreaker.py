@@ -39,6 +39,29 @@ identified by comparing this project against a real production narrative:
      reason attached, rather than retrying indefinitely or silently
      proceeding on incomplete data.
 
+  5. SUPERVISOR-WORKER REASONING. llm_fraud_reasoning is no longer one LLM
+     call doing everything. A supervisor now delegates to two narrow
+     specialist sub-agents that each retrieve/reason over only the slice
+     of state they need -- billing_coding_specialist (CPT/ICD plausibility
+     against retrieved guideline chunks only) and narrative_fraud_specialist
+     (free-text narrative against FWA case matches only) -- then
+     supervisor_synthesize combines both findings into the same
+     recommended_action/rationale/confidence structure the gate already
+     expects. This is the hierarchical-delegation ("supervisor") multi-agent
+     pattern: each specialist's prompt, retrieval scope, and even model
+     tier can be tuned independently without touching the other's logic or
+     the downstream gate.
+
+  6. EVALUATOR-OPTIMIZER SELF-CRITIQUE. evaluator_optimizer_check is a
+     second, cheap-tier LLM call that runs after the supervisor synthesizes
+     a decision and before the output guardrail: it checks whether the
+     synthesized rationale actually cites the retrieved guidelines/cases it
+     claims to, or drifts into plausible-sounding but ungrounded reasoning.
+     On a failed check it forces exactly one re-synthesis before escalating
+     -- this complements the output guardrail (which checks *format*, not
+     *faithfulness*) and is the second independent safety net over the
+     supervisor's output.
+
 Run: python3 04_claims_auth_hybrid_rag_confidence_circuitbreaker.py
 """
 
@@ -66,6 +89,7 @@ LLM_MODEL = "claude-sonnet-5"
 
 CACHE_DB_PATH = "embedding_cache.sqlite"
 MAX_TOOL_ERRORS = 2
+MAX_EVALUATOR_REGENERATIONS = 1  # the evaluator forces at most one re-synthesis, never an unbounded loop
 
 # Claims whose Pinecone call should simulate a hard, repeated outage --
 # used to demonstrate the circuit breaker deterministically.
@@ -242,36 +266,68 @@ def zapier_notify(payload: dict) -> dict:
     return {"status_code": 200, "mock": True}
 
 
-def llm_reason_about_claim_grounded(claim_id: str, narrative: str, rule_flags: list[str],
-                                     similar_cases: list[dict], guidelines: list[dict]) -> dict:
+def billing_coding_specialist_review(claim_id: str, rule_flags: list[str], guidelines: list[dict]) -> dict:
     """
-    RAG-grounded reasoning: the retrieved guideline TEXT is placed directly
-    in the prompt, with an explicit instruction to answer only from what's
-    provided. This is the key difference from POC #3, where the LLM only
-    ever saw a bare similarity score, never source text.
+    Narrow specialist #1: CPT/ICD code plausibility against retrieved
+    billing-guideline text ONLY. Never sees the narrative or FWA case
+    matches -- sub-agent isolation, so this specialist's context can't
+    bloat with fields it has no use for and its prompt/tier can be tuned
+    independently of the narrative specialist's.
     """
     guideline_block = "\n".join(f"- [{g['id']}] {g['text']}" for g in guidelines)
-    similar_block = "\n".join(f"- [{c['id']}] fused_score={c['fused_score']} :: {c.get('text', '')}" for c in similar_cases)
-
     prompt = (
-        "You are assisting a healthcare claims Special Investigations Unit (SIU). "
-        "Answer using ONLY the retrieved guidelines and similar-case text provided below. "
-        "If the retrieved material does not clearly support a conclusion, say so explicitly "
-        "rather than guessing. Respond with ONLY a JSON object with exactly these keys: "
-        '"recommended_action" (either "approve" or "flag_for_siu"), '
-        '"rationale" (one or two sentences, citing a guideline or case ID if used), '
-        '"confidence" (a number between 0 and 1).\n\n'
-        f"Claim ID: {claim_id}\n"
-        f"Narrative: {narrative}\n"
-        f"Rule-based flags: {rule_flags}\n\n"
-        f"Retrieved billing guidelines:\n{guideline_block}\n\n"
-        f"Retrieved similar FWA cases:\n{similar_block}\n"
+        "You are the Billing/Coding specialist on a claims-review team. Judge ONLY whether the "
+        "billed procedure code(s) are plausible against the retrieved guideline text below -- do "
+        "not consider anything else. Respond with ONLY a JSON object with keys "
+        '"finding" ("consistent" or "coding_concern"), "rationale" (cite a guideline id if used), '
+        '"confidence" (0-1).\n\n'
+        f"Claim ID: {claim_id}\nRule-based flags: {rule_flags}\n\n"
+        f"Retrieved billing guidelines:\n{guideline_block}\n"
     )
-
     if USE_LIVE_APIS:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        resp = client.messages.create(model=LLM_MODEL, max_tokens=300, messages=[{"role": "user", "content": prompt}])
+        resp = client.messages.create(model=LLM_MODEL, max_tokens=200, messages=[{"role": "user", "content": prompt}])
+        raw_text = resp.content[0].text
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError:
+            return {"_malformed_raw_output": raw_text}
+
+    cited_guideline = guidelines[0]["id"] if guidelines else "no guideline retrieved"
+    if rule_flags:
+        return {
+            "finding": "coding_concern",
+            "rationale": f"{len(rule_flags)} rule-based flag(s) present; potentially inconsistent with {cited_guideline}.",
+            "confidence": round(min(0.55 + 0.1 * len(rule_flags), 0.95), 2),
+        }
+    return {
+        "finding": "consistent",
+        "rationale": f"No rule-based flags; billed code(s) consistent with {cited_guideline}.",
+        "confidence": 0.9,
+    }
+
+
+def narrative_fraud_specialist_review(claim_id: str, narrative: str, similar_cases: list[dict]) -> dict:
+    """
+    Narrow specialist #2: free-text narrative against confirmed-FWA case
+    matches ONLY. Never sees the guideline corpus or rule flags -- the
+    counterpart isolation to the billing specialist above.
+    """
+    similar_block = "\n".join(f"- [{c['id']}] fused_score={c['fused_score']} :: {c.get('text', '')}" for c in similar_cases)
+    prompt = (
+        "You are the Narrative/Fraud specialist on a claims-review team. Judge ONLY whether this "
+        "claim's narrative resembles the confirmed-fraud cases retrieved below -- do not consider "
+        "billing codes. Respond with ONLY a JSON object with keys "
+        '"finding" ("clean" or "fraud_pattern_match"), "rationale" (cite a case id if used), '
+        '"confidence" (0-1).\n\n'
+        f"Claim ID: {claim_id}\nNarrative: {narrative}\n\n"
+        f"Retrieved similar FWA cases:\n{similar_block}\n"
+    )
+    if USE_LIVE_APIS:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        resp = client.messages.create(model=LLM_MODEL, max_tokens=200, messages=[{"role": "user", "content": prompt}])
         raw_text = resp.content[0].text
         try:
             return json.loads(raw_text)
@@ -280,21 +336,92 @@ def llm_reason_about_claim_grounded(claim_id: str, narrative: str, rule_flags: l
 
     top_case = similar_cases[0] if similar_cases else None
     top_score = top_case["dense_score"] if top_case else 0.0
-    if rule_flags or top_score >= 0.65:
-        cited_guideline = guidelines[0]["id"] if guidelines else "no guideline retrieved"
+    if top_score >= 0.65:
         return {
-            "recommended_action": "flag_for_siu",
-            "rationale": (
-                f"Claim exhibits {len(rule_flags)} rule-based flag(s) and a {top_score:.2f} dense "
-                f"similarity to case {top_case['id'] if top_case else 'n/a'}, consistent with {cited_guideline}."
-            ),
+            "finding": "fraud_pattern_match",
+            "rationale": f"{top_score:.2f} dense similarity to confirmed case {top_case['id']}.",
             "confidence": round(min(0.5 + 0.48 * top_score, 0.99), 2),
         }
     return {
-        "recommended_action": "approve",
-        "rationale": "No rule-based flags; low similarity to known FWA cases; retrieved guidelines do not indicate a violation.",
-        "confidence": 0.93,
+        "finding": "clean",
+        "rationale": "Low similarity to all known FWA cases.",
+        "confidence": 0.92,
     }
+
+
+def supervisor_synthesize_findings(claim_id: str, billing_finding: dict, narrative_finding: dict) -> dict:
+    """
+    The supervisor: reads both specialists' independent findings (never the
+    raw retrieval or narrative itself -- it synthesizes conclusions, it
+    doesn't re-derive them) and produces the single recommended_action /
+    rationale / confidence structure the rest of the graph already expects.
+    Either specialist raising a concern is enough to flag the claim -- the
+    supervisor doesn't average away one specialist's signal with the
+    other's silence.
+    """
+    billing_flagged = billing_finding.get("finding") == "coding_concern"
+    narrative_flagged = narrative_finding.get("finding") == "fraud_pattern_match"
+
+    if billing_flagged or narrative_flagged:
+        parts = []
+        if billing_flagged:
+            parts.append(f"billing/coding specialist: {billing_finding.get('rationale', '')}")
+        if narrative_flagged:
+            parts.append(f"narrative/fraud specialist: {narrative_finding.get('rationale', '')}")
+        confidence = max(
+            billing_finding.get("confidence", 0.0) if billing_flagged else 0.0,
+            narrative_finding.get("confidence", 0.0) if narrative_flagged else 0.0,
+        )
+        return {
+            "recommended_action": "flag_for_siu",
+            "rationale": "; ".join(parts),
+            "confidence": round(float(confidence), 2),
+        }
+    return {
+        "recommended_action": "approve",
+        "rationale": (
+            f"billing/coding specialist: {billing_finding.get('rationale', '')}; "
+            f"narrative/fraud specialist: {narrative_finding.get('rationale', '')}"
+        ),
+        "confidence": round(min(float(billing_finding.get("confidence", 0.9)), float(narrative_finding.get("confidence", 0.9))), 2),
+    }
+
+
+def evaluator_optimizer_faithfulness_check(rationale: str, guidelines: list[dict], similar_cases: list[dict]) -> dict:
+    """
+    A second, cheap-tier LLM call that checks the supervisor's synthesized
+    rationale actually cites material that was retrieved, rather than
+    drifting into plausible-sounding but ungrounded reasoning. Distinct
+    from run_output_guardrail: the guardrail checks *format* (is this valid,
+    well-formed output); this checks *faithfulness* (is the reasoning
+    actually grounded in what was retrieved).
+    """
+    retrieved_ids = {g["id"] for g in guidelines} | {c["id"] for c in similar_cases}
+
+    if USE_LIVE_APIS:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        prompt = (
+            "Does the rationale below cite ONLY ids from this retrieved set, or does it assert "
+            "something the retrieved material doesn't support? Respond with ONLY JSON: "
+            '{"faithful": true|false, "reason": "..."}.\n\n'
+            f"Retrieved ids: {sorted(retrieved_ids)}\nRationale: {rationale}\n"
+        )
+        resp = client.messages.create(model="claude-haiku-4-5", max_tokens=100, messages=[{"role": "user", "content": prompt}])
+        raw_text = resp.content[0].text
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError:
+            return {"faithful": False, "reason": "evaluator output was not valid JSON"}
+
+    # Mock: a cited-id must actually be among what was retrieved. A rationale
+    # that names no id at all is treated as faithful-by-default (nothing to
+    # contradict), matching the "approve, nothing flagged" case above.
+    cited = set(re.findall(r"\b(?:guideline-cms-[\d.]+[a-z]?|past-fwa-\d+)\b", rationale))
+    hallucinated = cited - retrieved_ids
+    if hallucinated:
+        return {"faithful": False, "reason": f"rationale cites {sorted(hallucinated)}, not present in retrieved set"}
+    return {"faithful": True, "reason": "all cited ids (if any) are in the retrieved set"}
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +489,11 @@ class ClaimState(TypedDict):
     similar_cases: list[dict]
     retrieved_guidelines: list[dict]
     rule_fraud_flags: list[str]
+    billing_finding: dict
+    narrative_finding: dict
     llm_output: dict
+    evaluator_critique: dict
+    evaluator_regeneration_count: int
     output_guardrail_passed: bool
     output_guardrail_reason: str
     guardrail_override: bool
@@ -492,13 +623,54 @@ def retrieve_guidelines(state: ClaimState) -> dict:
     return {"retrieved_guidelines": guidelines, "log": [f"retrieve_guidelines: retrieved={[g['id'] for g in guidelines]}"]}
 
 
-def llm_fraud_reasoning(state: ClaimState) -> dict:
-    print("  -> [llm_fraud_reasoning] executing (LLM, grounded in retrieved guidelines)")
-    output = llm_reason_about_claim_grounded(
-        state["claim_id"], state["narrative"], state["rule_fraud_flags"],
-        state["similar_cases"], state["retrieved_guidelines"],
+def billing_coding_specialist(state: ClaimState) -> dict:
+    print("  -> [billing_coding_specialist] executing (narrow scope: rule flags + guidelines only)")
+    finding = billing_coding_specialist_review(state["claim_id"], state["rule_fraud_flags"], state["retrieved_guidelines"])
+    return {"billing_finding": finding, "log": [f"billing_coding_specialist: finding={finding}"]}
+
+
+def narrative_fraud_specialist(state: ClaimState) -> dict:
+    print("  -> [narrative_fraud_specialist] executing (narrow scope: narrative + FWA matches only)")
+    finding = narrative_fraud_specialist_review(state["claim_id"], state["narrative"], state["similar_cases"])
+    return {"narrative_finding": finding, "log": [f"narrative_fraud_specialist: finding={finding}"]}
+
+
+def supervisor_synthesize(state: ClaimState) -> dict:
+    print("  -> [supervisor_synthesize] executing (combining both specialists' findings)")
+    output = supervisor_synthesize_findings(state["claim_id"], state["billing_finding"], state["narrative_finding"])
+    return {"llm_output": output, "log": [f"supervisor_synthesize: output={output}"]}
+
+
+def evaluator_optimizer_check(state: ClaimState) -> dict:
+    print("  -> [evaluator_optimizer_check] executing (faithfulness self-critique, cheap-tier)")
+    critique = evaluator_optimizer_faithfulness_check(
+        state["llm_output"].get("rationale", ""), state["retrieved_guidelines"], state["similar_cases"],
     )
-    return {"llm_output": output, "log": [f"llm_fraud_reasoning: output={output}"]}
+    return {"evaluator_critique": critique, "log": [f"evaluator_optimizer_check: critique={critique}"]}
+
+
+def route_after_evaluator(state: ClaimState) -> str:
+    if state["evaluator_critique"].get("faithful", True):
+        return "output_guardrail_check"
+    if state.get("evaluator_regeneration_count", 0) < MAX_EVALUATOR_REGENERATIONS:
+        return "supervisor_synthesize_retry"
+    return "output_guardrail_check"  # exhausted the one allowed regeneration -- let the output guardrail's fail-closed path catch it
+
+
+def supervisor_synthesize_retry(state: ClaimState) -> dict:
+    # One bounded re-synthesis, per MAX_EVALUATOR_REGENERATIONS -- never an
+    # unbounded generate/critique loop. Re-runs the same synthesis (in live
+    # mode this would re-prompt the supervisor LLM with the evaluator's
+    # critique attached); the count guards against looping forever if the
+    # specialists' findings themselves are what's ungrounded.
+    print("  -> [supervisor_synthesize_retry] executing (evaluator flagged unfaithful reasoning, re-synthesizing once)")
+    output = supervisor_synthesize_findings(state["claim_id"], state["billing_finding"], state["narrative_finding"])
+    count = state.get("evaluator_regeneration_count", 0) + 1
+    return {
+        "llm_output": output,
+        "evaluator_regeneration_count": count,
+        "log": [f"supervisor_synthesize_retry: attempt #{count}, output={output}"],
+    }
 
 
 def output_guardrail_check(state: ClaimState) -> dict:
@@ -626,7 +798,11 @@ def build_graph(checkpointer):
         ("check_similar_fraud_cases_hybrid", check_similar_fraud_cases_hybrid),
         ("circuit_breaker_escalate", circuit_breaker_escalate),
         ("retrieve_guidelines", retrieve_guidelines),
-        ("llm_fraud_reasoning", llm_fraud_reasoning),
+        ("billing_coding_specialist", billing_coding_specialist),
+        ("narrative_fraud_specialist", narrative_fraud_specialist),
+        ("supervisor_synthesize", supervisor_synthesize),
+        ("evaluator_optimizer_check", evaluator_optimizer_check),
+        ("supervisor_synthesize_retry", supervisor_synthesize_retry),
         ("output_guardrail_check", output_guardrail_check),
         ("force_siu_fallback", force_siu_fallback),
         ("confidence_decision_gate", confidence_decision_gate),
@@ -659,8 +835,19 @@ def build_graph(checkpointer):
         },
     )
     g.add_edge("circuit_breaker_escalate", "notify_siu_zapier")
-    g.add_edge("retrieve_guidelines", "llm_fraud_reasoning")
-    g.add_edge("llm_fraud_reasoning", "output_guardrail_check")
+    # Supervisor-worker fan-out: both specialists run off the same
+    # retrieved guidelines/similar-cases state, each reading only the
+    # slice it needs, then fan back in to the supervisor.
+    g.add_edge("retrieve_guidelines", "billing_coding_specialist")
+    g.add_edge("retrieve_guidelines", "narrative_fraud_specialist")
+    g.add_edge("billing_coding_specialist", "supervisor_synthesize")
+    g.add_edge("narrative_fraud_specialist", "supervisor_synthesize")
+    g.add_edge("supervisor_synthesize", "evaluator_optimizer_check")
+    g.add_conditional_edges(
+        "evaluator_optimizer_check", route_after_evaluator,
+        {"output_guardrail_check": "output_guardrail_check", "supervisor_synthesize_retry": "supervisor_synthesize_retry"},
+    )
+    g.add_edge("supervisor_synthesize_retry", "output_guardrail_check")
     g.add_conditional_edges(
         "output_guardrail_check", route_after_output_guardrail,
         {"confidence_decision_gate": "confidence_decision_gate", "force_siu_fallback": "force_siu_fallback"},
@@ -687,7 +874,10 @@ if __name__ == "__main__":
 
     with SqliteSaver.from_conn_string("claims_v4_checkpoints.sqlite") as checkpointer:
         graph = build_graph(checkpointer)
-        base = {"log": [], "fraud_flags": [], "siu_decision": None, "rule_fraud_flags": [], "tool_error_count": 0}
+        base = {
+            "log": [], "fraud_flags": [], "siu_decision": None, "rule_fraud_flags": [],
+            "tool_error_count": 0, "evaluator_regeneration_count": 0,
+        }
 
         clean_narrative = (
             "Routine annual wellness visit, CPT 99395, no complications, "

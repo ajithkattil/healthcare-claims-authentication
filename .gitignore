@@ -1,1 +1,8 @@
 .backup/
+.DS_Store
+*.sqlite
+*.sqlite-journal
+__pycache__/
+*.pyc
+.venv/
+venv/
