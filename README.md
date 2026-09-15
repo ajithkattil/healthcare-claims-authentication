@@ -458,6 +458,7 @@ maps to standard agentic-AI terminology.
 | `.env.example` | Template for API keys, only needed if you flip to live mode. |
 | `evals/` | Automated evals suite (pytest) covering guardrails, the model gateway, the confidence gate, the circuit breaker, retrieval quality, and end-to-end golden-claim regression. See [Evals Framework](#evals-framework) below. |
 | `requirements-eval.txt` | Dependencies for `evals/` (just `pytest` — see the file for why `ragas`/`deepeval` aren't included here). |
+| `ROADMAP.md` | Consolidated, trackable list of what's missing between this POC and a production-grade system — see [Known limitations](#known-limitations-by-design-for-poc-scope) below for the short version. |
 
 ## Agentic AI Pattern Mapping
 
@@ -911,6 +912,11 @@ before citing narrative length as a real routing factor.
 | Evaluator-optimizer reports `faithful: False` on a claim you didn't expect | Check whether the supervisor's synthesized rationale cites a guideline/case id that wasn't actually in `retrieved_guidelines`/`similar_cases` for that claim — that's exactly the drift it's designed to catch |
 
 ## Known limitations (by design, for POC scope)
+
+See [ROADMAP.md](ROADMAP.md) for the full, tiered, trackable version of this list —
+what blocks pointing this at real claim data at all (auth on the app itself, an audit
+trail, data retention), what breaks first at production volume, and what's genuinely
+valuable but not urgent. The bullets below are the short version.
 
 - Fraud detection logic combines deterministic rules, hybrid similarity, and LLM
   reasoning — none of these are a trained fraud model
