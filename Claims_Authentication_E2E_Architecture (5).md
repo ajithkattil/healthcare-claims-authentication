@@ -349,14 +349,3 @@ Orchestrator and gateway services run as stateless pods on **EKS**, horizontally
 
 ---
 
-## 10. Mapping Back to the POC Scripts
-
-| Architecture element | Proven in POC script |
-|---|---|
-| Checkpointed state, failure recovery | 00 |
-| Human-in-the-loop interrupt, conditional routing | 01 |
-| External integrations (Cohere/Pinecone/Zapier), mock/live toggle | 02 |
-| LLM call, input/output guardrails, embedding cache | 03 |
-| Hybrid retrieval, RAG grounding, confidence gate, circuit breaker | 04 |
-| Structure-aware chunking, hybrid fusion (weighted + RRF) | 05 |
-| Auth, gateway, multi-tenancy, PII redaction, long-term memory, low-risk pre-filter, RAGAS/DeepEval, prompt versioning, capacity/scaling strategy | Not in POC — production-only additions covered in this document |
