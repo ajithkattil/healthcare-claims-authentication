@@ -6,3 +6,4 @@ anthropic
 rank_bm25
 requests
 python-dotenv
+gradio==6.27.0

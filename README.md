@@ -1,3 +1,14 @@
+---
+title: Healthcare Claims Authentication POC
+emoji: 🩺
+colorFrom: blue
+colorTo: green
+sdk: gradio
+sdk_version: 6.27.0
+app_file: app.py
+pinned: false
+---
+
 # Healthcare Claims Authentication POC — LangGraph + Cohere + Pinecone + Zapier
 
 A proof-of-concept agentic workflow for healthcare claims authentication, built on
@@ -107,7 +118,8 @@ maps to standard agentic-AI terminology.
 | `agentic_patterns_review.md` | How this project maps to 2026 agentic-AI patterns (routing, supervisor-worker, evaluator-optimizer, OWASP Agentic Top 10) and what's still roadmap vs. actually built. |
 | `production_additions_explainer.md` | Implementation notes for the seven production-only elements from the architecture doc that aren't in the POC scripts (gateway/auth, tenancy, tokenization, pre-filter, long-term memory, prompt versioning, RAGAS/DeepEval). |
 | `Claude outputs/claims-final-architecture.md` | Source markdown for the "final architecture v2" reference doc spanning all three design passes (POC, production-hardening, 2026 agentic patterns). |
-| `requirements.txt` | Python dependencies, including the Anthropic SDK and `rank_bm25`. |
+| `app.py` | Gradio web UI wrapping the primary graph for a shareable demo (preset + custom mock claims, interactive human-in-the-loop review). Deploy target: Hugging Face Spaces — see "Sharing this demo" below. |
+| `requirements.txt` | Python dependencies, including the Anthropic SDK, `rank_bm25`, and `gradio`. |
 | `.env.example` | Template for API keys, only needed if you flip to live mode. |
 
 ## Agentic AI Pattern Mapping
@@ -329,6 +341,55 @@ local SQLite checkpoint file — safe to delete between runs if you want a clean
 - Compares `weighted_fusion` (min-max normalized weighted sum) against
   `reciprocal_rank_fusion` on the same query, printing both rankings so you can
   see where they agree and where they don't.
+
+## Sharing this demo (Hugging Face Spaces)
+
+`app.py` wraps `claims_auth_hybrid_rag_confidence_circuitbreaker.py`'s graph in a
+small [Gradio](https://gradio.app) UI: pick one of four preset mock claims (or type
+your own), submit it, and watch the node trace and final decision. If a claim lands
+in the "uncertain middle," you become the SIU reviewer yourself — Approve or Deny —
+and the graph resumes exactly where LangGraph's checkpointer paused it.
+
+The app runs entirely in **mock mode** (`USE_LIVE_APIS = False`), so it needs no API
+keys and costs nothing to host publicly. The YAML block at the very top of this file
+is Hugging Face Spaces' own config format — GitHub just renders it as a plain
+horizontal rule, but a Space reads it as the app's title, emoji, and SDK.
+
+**Run it locally first:**
+
+```bash
+python3 -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+python3 app.py
+```
+
+Gradio prints a local URL (`http://127.0.0.1:7860`) — open it in a browser.
+
+**Deploy to Hugging Face Spaces:**
+
+1. Create a free account at [huggingface.co](https://huggingface.co) if you don't
+   have one, then go to **New Space** (top-right profile menu → "New Space").
+2. Give it a name, pick **Gradio** as the SDK, choose **Public** visibility, and
+   create it. Hugging Face gives the new Space its own git repository.
+3. Add it as a second git remote alongside your existing `origin` (GitHub) and push:
+   ```bash
+   git remote add space https://huggingface.co/spaces/<your-username>/<space-name>
+   git push space main
+   ```
+   You'll need a Hugging Face access token as the password when prompted (Settings →
+   Access Tokens → create one with **write** scope) — GitHub credentials won't work
+   here, this is a separate service with its own login.
+4. The Space builds automatically (installs `requirements.txt`, then runs `app.py`
+   because of `app_file: app.py` in the YAML block) and gives you a public URL like
+   `https://huggingface.co/spaces/<your-username>/<space-name>` to share.
+5. To update the demo later, just push again: `git push space main`.
+
+Keeping the public Space in mock mode is the right default — no API keys ever touch
+a public server, and every preset claim is fully synthetic. If you later want a
+**live** Space, add your keys as Hugging Face **Secrets** (Space settings → Variables
+and secrets) rather than committing an `.env` file, and flip `USE_LIVE_APIS = True`
+in `claims_auth_hybrid_rag_confidence_circuitbreaker.py`.
 
 ## Switching to live APIs
 
