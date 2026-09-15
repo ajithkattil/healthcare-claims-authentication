@@ -19,11 +19,91 @@ specialist sub-agents, an evaluator-optimizer faithfulness check, and a human-in
 SIU (Special Investigations Unit) review gate, with optional live integrations to
 Cohere, Pinecone, Anthropic, and Zapier.
 
+## Getting Started (first-time setup)
+
+This is the from-zero walkthrough for a machine that doesn't have anything set up yet.
+If `venv/` already exists and you just want the app running again after a reboot, skip
+straight to "Quick start" below — that's the two-command version of steps 3-5 here.
+
+**1. Prerequisites**
+
+- Python 3.10 or later (developed and tested on 3.12)
+- `git`, to clone the repo
+- No API keys or external accounts needed — this runs entirely in mock mode by default
+
+**2. Clone the repo and create a virtual environment**
+
+```bash
+git clone <this-repo-url>
+cd healthcare-claims-authentication
+python3 -m venv venv
+source venv/bin/activate        # on Windows: venv\Scripts\activate
+```
+
+> **Build the venv on the same machine and OS you'll actually run it from.** A venv
+> created inside a Linux container or VM that's bridged to a macOS/Windows folder ends
+> up with interpreter symlinks that only resolve inside that container — the app then
+> fails with `ModuleNotFoundError: No module named 'gradio'` even though the install
+> clearly succeeded, because `venv/bin/python` is pointing at a Python that doesn't
+> exist from your real terminal's point of view. If that happens, see the first row of
+> "Troubleshooting" below. The fix is to delete `venv/` and re-run the command above
+> from the actual terminal you intend to launch the app from.
+
+**3. Install dependencies**
+
+```bash
+pip install -r requirements.txt
+```
+
+Optional, only if you want to run the automated test suite (see
+[Evals Framework](#evals-framework) below): `pip install -r requirements-eval.txt`. It's
+a separate file specifically so installing the app itself doesn't also pull in `pytest`
+for people who don't need it.
+
+**4. Verify the install (optional, but worth doing once)**
+
+Run each mock-mode script once, in the order listed under
+[Run — mock mode](#run--mock-mode-default-no-api-keys-needed) below. It's the fastest way
+to confirm the environment actually works end to end before touching the UI, and
+doubles as the quickest tour of what this project does, node by node — each script
+builds on the one before it.
+
+**5. Bring up the app**
+
+There's exactly one process to start, not several. `app.py` is a single Gradio server
+with the entire LangGraph pipeline already running inside it — in mock mode, Cohere,
+Pinecone, Anthropic, and Zapier are all stubbed out in-process, not separate services
+you need to start on their own. Nothing else has to be running first.
+
+```bash
+python3 app.py
+```
+
+Wait a few seconds for:
+
+```
+Running on local URL:  http://127.0.0.1:7860
+Running on public URL: https://xxxxxxxxxxxxxxxxxx.gradio.live
+```
+
+Open the local URL in a browser, or share the public `.gradio.live` one (it expires on
+its own after 72 hours regardless). `Ctrl+C` in that terminal stops the server.
+
+**What's next**
+
+- From here on, "Quick start" below is all you need after closing the terminal or
+  restarting your machine — `venv/` and `requirements.txt` are already in place.
+- To point this at real Cohere/Pinecone/Anthropic/Zapier accounts instead of mock mode,
+  see [Switching to live APIs](#switching-to-live-apis).
+- To host the app somewhere other than your own machine, see
+  [Sharing this app](#sharing-this-app-hugging-face-spaces).
+
 ## Quick start (every time you restart your laptop)
 
-Everything below is one-time setup — once `venv/` exists with dependencies installed,
-this is the only sequence you need after a reboot. Run it in your own Terminal, not
-through any other tool, since the Gradio server has to keep running in that window.
+This assumes you've already done the first-time setup in "Getting Started" above —
+once `venv/` exists with dependencies installed, this is the only sequence you need
+after a reboot. Run it in your own Terminal, not through any other tool, since the
+Gradio server has to keep running in that window.
 
 ```bash
 cd ~/Desktop/code/healthcare-claims-authentication
@@ -496,20 +576,11 @@ checkpointing + `interrupt_before` for pausing on human review" is exactly what
   rate-limiting or spend caps, and the routing itself is rules-based rather than a learned
   or LLM-scored router.
 
-## Prerequisites
-
-- Python 3.10 or later (developed and tested on 3.12)
-- pip
-- No external accounts needed to run the POC as delivered (mock mode)
-- Optional, for live mode: a Cohere API key, a Pinecone API key + index, an Anthropic API key, and a Zapier webhook URL
-
-## Install
-
-```bash
-python3 -m venv venv
-source venv/bin/activate        # on Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
+See [Getting Started](#getting-started-first-time-setup) above for prerequisites,
+creating the virtual environment, and installing dependencies. No external accounts are
+needed to run the POC as delivered — live mode is optional and covered separately in
+[Switching to live APIs](#switching-to-live-apis), which lists exactly which API keys
+each integration needs.
 
 ## Run — mock mode (default, no API keys needed)
 
@@ -629,16 +700,11 @@ keys and costs nothing to host publicly. The YAML block at the very top of this 
 is Hugging Face Spaces' own config format — GitHub just renders it as a plain
 horizontal rule, but a Space reads it as the app's title, emoji, and SDK.
 
-**Run it locally first:**
-
-```bash
-python3 -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-python3 app.py
-```
-
-Gradio prints a local URL (`http://127.0.0.1:7860`) — open it in a browser.
+**Run it locally first:** if you haven't already, follow
+[Getting Started](#getting-started-first-time-setup) above to create the venv and
+install dependencies, then `python3 app.py` (or `venv/bin/python app.py` — see
+[Quick start](#quick-start-every-time-you-restart-your-laptop)). Gradio prints a local
+URL (`http://127.0.0.1:7860`) — open it in a browser.
 
 **Deploy to Hugging Face Spaces:**
 
@@ -834,7 +900,7 @@ before citing narrative length as a real routing factor.
 
 | Symptom | Likely cause |
 |---|---|
-| `ModuleNotFoundError: No module named 'langgraph'` (or `'gradio'`) | Virtual environment not activated, or `pip install -r requirements.txt` not run. If you *did* activate it and still see this, run `conda deactivate` first (if you also have Anaconda/Miniconda installed) and/or call the interpreter directly — `venv/bin/python app.py` — instead of relying on plain `python` on PATH, since conda's `base` environment can shadow the venv's `python` |
+| `ModuleNotFoundError: No module named 'langgraph'` (or `'gradio'`) | Virtual environment not activated, or `pip install -r requirements.txt` not run. If you *did* activate it and still see this, run `conda deactivate` first (if you also have Anaconda/Miniconda installed) and/or call the interpreter directly — `venv/bin/python app.py` — instead of relying on plain `python` on PATH, since conda's `base` environment can shadow the venv's `python`. If it persists even after that, check `cat venv/pyvenv.cfg` — if `home =` points to a path that doesn't exist on this machine (e.g. a Linux path while you're on macOS), the venv was built inside a different container/VM than the one you're running from; delete `venv/` and rebuild it from the actual terminal you launch the app from (see the callout in "Getting Started" above) |
 | `pinecone-client` install error / deprecation exception on import | Use the `pinecone` package, not `pinecone-client` — this repo's `requirements.txt` already specifies the correct one |
 | Graph "resumes" but re-runs everything from scratch | You changed the `thread_id` between calls, or deleted the `.sqlite` file — the checkpointer has no history for a new thread |
 | `graph.invoke(None, config)` raises `KeyError` on thread | You must call the graph at least once with real input for a given `thread_id` before you can resume it with `None` |
