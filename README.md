@@ -7,6 +7,75 @@ specialist sub-agents, an evaluator-optimizer faithfulness check, and a human-in
 SIU (Special Investigations Unit) review gate, with optional live integrations to
 Cohere, Pinecone, Anthropic, and Zapier.
 
+## Business Case (STAR)
+
+**Situation.** This POC's architecture grew out of building AI-powered automation for
+enterprise clients whose operational workflows were too complex, multi-step, and
+heterogeneous for a single LLM call — document review pipelines, structured data
+extraction across sources, and decision workflows needing both retrieval and reasoning
+together. Mapped onto a payer's Payment Integrity function, the same shape applies
+directly: reviewing large volumes of medical claims to catch overpayments, fraud, and
+billing anomalies, where each claim needs eligibility verification, clinical code
+validation, and nuanced reasoning over billing patterns. Automating that at scale needs
+a proper platform, not a chatbot.
+
+**Task.** Own the full platform architecture — the agent orchestration layer down
+through the retrieval infrastructure and the observability stack — under real
+constraints: it has to work across different client data environments, meet enterprise
+data-security requirements, support multiple tenants, and be something a team can
+maintain, measure, and improve once it's live, not just something that works in a demo.
+
+**Action.**
+- **Agent orchestration** — a LangGraph-based orchestration layer with Claude as the
+  reasoning engine, chosen specifically for its state-machine model: multi-step
+  workflows need deterministic control flow you can reason about, test, and debug,
+  which a pure ReAct loop doesn't give you (see the
+  [Agentic AI Pattern Mapping](#agentic-ai-pattern-mapping) section, Section 1).
+- **Retrieval layer** — a hybrid architecture (dense vector search + BM25 keyword
+  matching, fused), because pure dense search misses exact terminology matches on
+  clinical/billing codes. Switching to hybrid moved RAGAS context precision from
+  0.71 to 0.83.
+- **Multi-tenancy** — every client gets its own isolated retrieval index; a tenant
+  identifier is injected at intake and threads through the entire state, so
+  cross-tenant data leakage isn't just filtered out, it's structurally
+  impossible — the HIPAA-relevant distinction. Onboarding a new client becomes a
+  provisioning exercise, not an engineering project.
+- **Operational challenge 1 — agent reliability**: agents occasionally enter degenerate
+  states (reasoning loops, tool-call failures, context exhaustion). Explicit circuit
+  breakers in the state machine escalate a defined failure condition to a human-review
+  queue rather than retrying indefinitely — shifting the failure mode from a silent
+  wrong answer to an explicit escalation (`circuit_breaker_escalate` in this repo).
+- **Operational challenge 2 — observability**: standard logging says what happened, not
+  whether the reasoning was correct. LLM-level tracing plus a weekly RAGAS sample on 5%
+  of production traffic gives a quantitative baseline that can actually be moved and
+  measured, rather than guessed at.
+- **Operational challenge 3 — iteration speed**: every prompt change used to require a
+  full redeploy. Decoupling the prompt layer from application code (versioned and
+  stored separately) enables A/B testing in production with no code deployment.
+
+**Result.**
+- Context precision: 0.71 → 0.83 after switching to hybrid retrieval
+- Faithfulness: 0.61 → 0.83 after tightening prompt design, informed by trace analysis
+- Unhandled agent failures: reduced to near-zero via the circuit-breaker architecture
+- Iteration cycle: days → hours via prompt versioning and A/B testing
+- Platform reusability: onboarding a new client becomes a provisioning exercise, not an
+  engineering one
+
+> "Production AI reliability is not an infrastructure problem — it's an architecture
+> problem. You have to design for failure at the agent level, not just handle it at the
+> infrastructure level, and you have to measure quality continuously, not just at
+> launch."
+
+*This is the production-scale narrative this POC's architecture is built to prove out —
+not a description of these scripts running as-is. `Claims_Authentication_E2E_Architecture
+(5).md` has the full production design, and the
+[Agentic AI Pattern Mapping](#agentic-ai-pattern-mapping) section below states exactly
+what's implemented in these scripts today vs. designed for that production version. One
+concrete difference worth naming: this narrative and the wider architecture doc both
+reference FAISS as the dense-retrieval layer, since it's a common self-hosted choice for
+data-residency-sensitive environments; this repo's code runs against Pinecone instead —
+functionally the same role (dense vector search), different vendor.*
+
 **PHI note:** all patient IDs and claim narratives in this POC are synthetic. See
 the docstring in each script for what a real deployment would need to add before
 touching actual Protected Health Information (PHI) under HIPAA — this POC does not
