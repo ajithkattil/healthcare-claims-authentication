@@ -197,6 +197,38 @@ you'd want the chunking script's approach wired into retrieval, plus a `tiktoken
 prompt-budget check before each `messages.create` call, rather than relying on the pieces
 staying small by construction.
 
+## Why hand-rolled routing instead of an existing LLM gateway tool?
+
+Open-source LLM gateways exist and are worth naming directly rather than pretending this
+POC exists in a vacuum: **LiteLLM** (MIT-licensed, self-hostable proxy/SDK in front of
+100+ providers behind one API, with fallbacks, load balancing, budgets, rate limiting, and
+spend tracking), **Portkey** (open-source gateway with conditional routing and governance
+controls), and **RouteLLM** (from LMSYS/Berkeley — the closest match conceptually, routing
+between a strong/weak model pair to save cost, trained on preference data rather than
+hand-written rules).
+
+`model_gateway_decide` is deliberately custom code instead of one of these, for reasons
+worth being able to defend out loud:
+
+- **This POC's point is to demonstrate the pattern is understood, not that a library was
+  imported.** "Here's the exact threshold and why it's anchored to the narrative
+  specialist's own 0.65 fraud threshold" is a stronger answer than "LiteLLM handles that."
+- **Auditability in a regulated domain.** A rules-based scorer is fully explainable — you
+  can point at the precise line that made a routing decision. A trained router (RouteLLM's
+  approach) is a classifier: harder to explain to a compliance reviewer asking why a
+  specific claim got routed to a specific model tier.
+- **RouteLLM's training data doesn't transfer here anyway.** It's trained on general
+  chat-quality preference data, not domain-specific signals like claim amount, rule flags,
+  or similarity band — a claims-specific policy still has to be built by hand regardless of
+  which router library sits underneath it.
+
+**For a real production build, the honest answer is "both, for different jobs":** adopt
+something like LiteLLM as the actual gateway layer for the plumbing that shouldn't be
+reinvented — unified multi-provider auth, retries, rate limiting, spend tracking,
+observability — and keep `model_gateway_decide` as the custom routing *policy* plugged
+into it. Don't rebuild undifferentiated infrastructure; do own the domain-specific decision
+logic, since that's where the compliance and business requirements actually live.
+
 ## Architecture
 
 ![Healthcare Claims Authentication architecture diagram](architecture_diagram_final.png)
