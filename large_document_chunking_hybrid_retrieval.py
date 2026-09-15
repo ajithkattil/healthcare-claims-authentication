@@ -6,9 +6,9 @@ WHY THIS SCRIPT EXISTS
 -----------------------
 POCs #3 and #4 do real RAG grounding, but over a *tiny* hardcoded guideline
 corpus (three short strings). That's fine for proving the graph logic, but
-it skips the exact question that shows up in real interviews and real
-production systems: "your policy document is 200 pages -- what actually
-happens to it before an LLM can use it?"
+it skips a question that comes up constantly in real production systems:
+"your policy document is 200 pages -- what actually happens to it before
+an LLM can use it?"
 
 This script answers that end-to-end, standalone, so you can run it and
 watch each step:
@@ -19,8 +19,8 @@ watch each step:
      not be typed by hand).
 
   2. CHUNKING -- split that document into small, overlapping, section-aware
-     chunks. This is the part interviewers drill into. We do it in three
-     escalating ways so you can explain the tradeoffs of each:
+     chunks. This is the part that's easy to get wrong. We do it in three
+     escalating ways so the tradeoffs of each are clear:
        a) naive fixed-size chunking (what NOT to lead with)
        b) recursive/structure-aware chunking (split on headings/paragraphs
           first, only falling back to fixed-size inside a huge paragraph)
@@ -164,10 +164,10 @@ def _tokenize_words(text: str) -> list[str]:
 def naive_fixed_chunk(text: str, chunk_size_words: int = 80) -> list[str]:
     """
     (a) NAIVE fixed-size chunking, no overlap, no structure awareness.
-    Shown here ONLY so you can explain why you would NOT lead an interview
-    answer with this: it happily slices a rule in half if the boundary
-    lands mid-sentence, and a chunk near the START of section 2.3 might
-    read as gibberish with no idea it's about "repeat procedures."
+    Shown here ONLY so the failure mode is visible: it happily slices a
+    rule in half if the boundary lands mid-sentence, and a chunk near the
+    START of section 2.3 might read as gibberish with no idea it's about
+    "repeat procedures."
     """
     words = _tokenize_words(text)
     return [
@@ -349,8 +349,8 @@ def reciprocal_rank_fusion(dense_results: list[dict], bm25_ranked_ids: list[str]
     This is scale-free by construction -- you never have to worry about
     normalizing dense cosine scores (bounded, ~0-1) against BM25 scores
     (unbounded, corpus-size-dependent) because ranks are already
-    comparable across methods. It's a common answer when an interviewer
-    pushes past "how do you combine the scores" toward "what if the score
+    comparable across methods. This becomes the right answer once you push
+    past "how do you combine the scores" toward "what if the score
     distributions are wildly different shapes."
     """
     dense_ranked_ids = [r["id"] for r in dense_results]

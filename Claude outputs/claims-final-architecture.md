@@ -1,6 +1,6 @@
 # Healthcare Claims Authentication Platform — Final Architecture
 
-*Reference architecture v2 (final) — a single end-to-end map of every feature this project has accumulated across three design passes: the original LangGraph POC, the production-hardening additions (gateway, tenancy, memory), and the 2026 agentic-AI patterns pass (context engineering, multi-agent, MCP, temporal memory, trajectory evals, OWASP). Built to teach from: every box below is a real node in the graph, not an aspirational label.*
+*Reference architecture v2 (final) — a single end-to-end map of every feature this project has accumulated across three design passes: the original LangGraph POC, the production-hardening additions (gateway, tenancy, memory), and the 2026 agentic-AI patterns pass (context engineering, multi-agent, MCP, temporal memory, trajectory evals, OWASP). Every box below is a real node in the graph, not an aspirational label.*
 
 **Tags:** LangGraph StateGraph · Hybrid RAG · Supervisor–Worker · Human-in-the-Loop · Multi-tenant/HIPAA · MCP tool layer · 3-level evaluation
 
@@ -220,7 +220,7 @@ Every node execution, tool call, and routing decision is a span under one root t
 
 ## 17. Security — OWASP Top 10 for Agentic Applications (2026)
 
-Roughly half of this list is mitigated by design choices already made for other reasons; presenting it as a checklist against a real architecture is far more convincing to students than presenting it cold.
+Roughly half of this list is mitigated by design choices already made for other reasons; presenting it as a checklist against a real architecture is far more convincing than presenting it cold.
 
 | Risk | Mitigation in this platform | Status |
 |---|---|---|

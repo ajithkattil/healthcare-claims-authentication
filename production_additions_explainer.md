@@ -1,6 +1,6 @@
-# Production Additions — Implementation Notes (Interview Explainer)
+# Production Additions — Implementation Notes
 
-Covers the seven architecture elements from the design doc that aren't in POC scripts 00–05: **gateway/auth, multi-tenancy, PII tokenization, low-risk pre-filter, long-term memory, prompt/policy versioning, RAGAS/DeepEval.** Each section below is "how I'd implement it" at the level you'd walk an interviewer through on a whiteboard — key classes, where it sits in the graph, and the one or two design decisions worth defending.
+Covers the seven architecture elements from the design doc that aren't in POC scripts 00–05: **gateway/auth, multi-tenancy, PII tokenization, low-risk pre-filter, long-term memory, prompt/policy versioning, RAGAS/DeepEval.** Each section below sketches the implementation shape — key classes, where it sits in the graph, and the one or two design decisions worth calling out.
 
 ---
 
@@ -25,7 +25,7 @@ async def gateway_middleware(request, call_next):
     request.state.ctx = ctx
     return await call_next(request)
 ```
-**Design point to defend:** `tenant_id` comes from the verified token claim, not a request field — a request body is user-controllable, so trusting it there would be a cross-tenant leak waiting to happen. Rate limiting (token-bucket per tenant) and the PII redaction proxy (see #3) also live here, so every node downstream inherits them for free instead of re-implementing per node.
+**Design rationale:** `tenant_id` comes from the verified token claim, not a request field — a request body is user-controllable, so trusting it there would be a cross-tenant leak waiting to happen. Rate limiting (token-bucket per tenant) and the PII redaction proxy (see #3) also live here, so every node downstream inherits them for free instead of re-implementing per node.
 
 ---
 
@@ -42,7 +42,7 @@ class ClaimState(TypedDict):
 def get_vector_index(tenant_id: str) -> Pinecone.Index:
     return pinecone_client.Index(f"fwa-cases-{tenant_id}")  # separate index, not shared+filtered
 ```
-**Design point to defend:** separate Pinecone index per tenant, not one shared index with a `tenant_id` metadata filter. Costs more to operate, but it's the difference between "one payer's data is filtered out" and "one payer's data is physically unreachable" — the latter is what a HIPAA auditor wants to hear. Same logic applies to the Postgres claim-history table (row-level tenant scoping) and to observability (every span tagged `tenant_id` at instrumentation time).
+**Design rationale:** separate Pinecone index per tenant, not one shared index with a `tenant_id` metadata filter. Costs more to operate, but it's the difference between "one payer's data is filtered out" and "one payer's data is physically unreachable" — the latter is what a HIPAA auditor wants to hear. Same logic applies to the Postgres claim-history table (row-level tenant scoping) and to observability (every span tagged `tenant_id` at instrumentation time).
 
 ---
 
@@ -61,7 +61,7 @@ class Tokenizer:
 ```
 Every downstream service — cache, vector store, LLM prompt, Zapier payload — operates only on the token. The narrative-text guardrail additionally regex/NER-scans for PHI typed directly into free text (structural tokenization only catches known fields).
 
-**Design point to defend:** tokenize at the perimeter, operate on tokens everywhere inside, resolve back to PHI only at systems of record. Token resolution is its own audited RBAC operation — never an implicit side effect of another action.
+**Design rationale:** tokenize at the perimeter, operate on tokens everywhere inside, resolve back to PHI only at systems of record. Token resolution is its own audited RBAC operation — never an implicit side effect of another action.
 
 ---
 
@@ -80,7 +80,7 @@ def assign_tier(claim: ClaimState) -> str:
         return "human"
     return "sonnet"
 ```
-**Design point to defend:** this is a cost lever, not just a routing convenience — most claim volume is low-risk and shouldn't touch the LLM at all. It's also why capacity scales: the LLM call is the bottleneck, and the pre-filter is what keeps it off the critical path for the majority of traffic.
+**Design rationale:** this is a cost lever, not just a routing convenience — most claim volume is low-risk and shouldn't touch the LLM at all. It's also why capacity scales: the LLM call is the bottleneck, and the pre-filter is what keeps it off the critical path for the majority of traffic.
 
 ---
 
@@ -103,7 +103,7 @@ def on_escalation_closed(claim: ClaimState, reviewer_decision: str):
     if reviewer_decision == "confirmed_fraud":
         fwa_index.upsert(vector=claim["narrative_embedding"], metadata={"tenant_id": ...})
 ```
-**Design point to defend:** this is the feedback loop that makes the system get better over time — every SIU reviewer decision that confirms fraud becomes retrieval signal for every future claim, without retraining anything. It's also why it's architecturally separate from the checkpointer: checkpointing needs to be fast/disposable, long-term memory needs to be queryable across all threads.
+**Design rationale:** this is the feedback loop that makes the system get better over time — every SIU reviewer decision that confirms fraud becomes retrieval signal for every future claim, without retraining anything. It's also why it's architecturally separate from the checkpointer: checkpointing needs to be fast/disposable, long-term memory needs to be queryable across all threads.
 
 ---
 
@@ -126,7 +126,7 @@ def load_prompt(name: str) -> str:
 ```
 Every trace records which prompt version was active, so a faithfulness-score change is attributable to a specific edit, not unexplained drift. A/B testing is just routing a percentage of traffic to a second `active` row and comparing evaluation scores before promoting.
 
-**Design point to defend:** decouples prompt tuning from CI/CD — a wording fix ships as a database write, not a redeploy, which matters because prompts change on a "we found a failure mode" cadence, faster than any release train.
+**Design rationale:** decouples prompt tuning from CI/CD — a wording fix ships as a database write, not a redeploy, which matters because prompts change on a "we found a failure mode" cadence, faster than any release train.
 
 ---
 
@@ -143,12 +143,12 @@ def weekly_eval_job():
     if ragas_scores["faithfulness"].mean() < FAITHFULNESS_FLOOR:
         alert_observability_team()
 ```
-**Design point to defend:** this turns "is the reasoning still grounded" into a trend line instead of a launch-day guess — and running it on a *sample*, offline, keeps it from adding latency or cost to every claim.
+**Design rationale:** this turns "is the reasoning still grounded" into a trend line instead of a launch-day guess — and running it on a *sample*, offline, keeps it from adding latency or cost to every claim.
 
 ---
 
-## Talking points if pressed
+## Open questions worth tracking
 
-- **Why not build all seven into the POC?** The POC's job (00–05) was to prove the orchestration and retrieval mechanics work; these seven are infra/platform concerns that would be engineering effort disproportionate to a learning exercise — they're documented and designed, not hand-waved.
-- **Which one would you build first in a real 90-day plan?** The gateway + multi-tenancy + tokenization, because it's the compliance floor — nothing else can go live without it.
-- **What's the hardest one to get right?** The confidence gate's interaction with the low-risk pre-filter and model-tier table — three independent three-way decisions (tier, gate, circuit breaker) that have to agree on what "escalate" means, or a claim can silently fall through a gap between them.
+- **Why aren't all seven built into the POC?** The POC's job (00–05) was to prove the orchestration and retrieval mechanics work; these seven are infra/platform concerns that represent real engineering effort beyond that scope — they're documented and designed here, not hand-waved or skipped silently. See ROADMAP.md for where each one is tracked.
+- **Build order for a real rollout:** the gateway + multi-tenancy + tokenization first, because together they're the compliance floor — nothing else can go live without it.
+- **The trickiest interaction to get right:** the confidence gate's interaction with the low-risk pre-filter and model-tier table — three independent three-way decisions (tier, gate, circuit breaker) that have to agree on what "escalate" means, or a claim can silently fall through a gap between them.

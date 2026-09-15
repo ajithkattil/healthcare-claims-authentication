@@ -155,10 +155,10 @@ and resumes exactly where it left off" claim made in the rest of this repo, incl
 review gate you'll meet in the next script and the circuit breaker's retry loop several scripts
 from now.
 
-**Mentor's note:** if someone asks you in an interview "how does LangGraph handle a node that
-crashes halfway through a long pipeline," this script is your answer, and you can point at the
-exact two-line proof (Run 1's traceback, Run 2's absent print statements) rather than describing
-it abstractly.
+**Mentor's note:** whenever you need to explain how LangGraph handles a node that crashes
+halfway through a long pipeline, this script is the answer, and you can point at the exact
+two-line proof (Run 1's traceback, Run 2's absent print statements) rather than describing it
+abstractly.
 
 ---
 
@@ -562,8 +562,8 @@ this demo. With a **real** embedding model, a pure paraphrase (same meaning, zer
 vocabulary) would still score meaningfully on the dense side — that gap between "shares no words"
 and "shares no meaning" is the actual production argument for hybrid retrieval, and this mock
 simply can't demonstrate it without a real semantic model. Being able to draw this exact
-distinction — what the mock can and can't prove — is a good instinct to carry into any interview
-about this repo.
+distinction — what the mock can and can't prove — is a good habit to carry into any discussion
+of this repo's design.
 
 **The relevance floor — grounding only when something is actually relevant:**
 
@@ -694,8 +694,8 @@ signal's `+1` can move a score from 0→1, 3→4, or 4→5 — but it can **neve
 on which tier gets picked, since crossing the `>=3` threshold from below would require a base
 score of exactly 2, which this function can never produce. The "long/detailed narrative" reason
 string is, today, purely cosmetic. This isn't a bug — it's a genuine, provable property of the
-current threshold design, and it's exactly the kind of thing worth being able to explain if
-you're asked to critique your own architecture in an interview.
+current threshold design, and it's exactly the kind of self-critique worth being able to explain
+clearly about your own architecture.
 
 ### 6.4 Supervisor-worker: two narrow specialists, then a synthesis step
 
@@ -1424,10 +1424,10 @@ hand; now it's one assertion that runs on every `pytest` invocation.
 If you only remember one thing from Part 1, make it this: every idea in the final script
 (hybrid retrieval, RAG grounding, the model gateway, supervisor-worker delegation, the
 evaluator-optimizer loop, the circuit breaker, the confidence gate) was introduced *one at a
-time*, in a script of its own, before all seven landed together. If you're ever asked to explain
-any one of those seven ideas in isolation, you have an entire standalone script that demonstrates
-just that one idea with nothing else in the way — that's a genuinely useful thing to have in your
-back pocket for an interview, not just a nice way to organize a repo.
+time*, in a script of its own, before all seven landed together. Whenever you need to explain any
+one of those seven ideas in isolation, you have an entire standalone script that demonstrates
+just that one idea with nothing else in the way — that's a genuinely useful reference to keep
+close, not just a nice way to organize a repo.
 
 If you only remember one thing from Part 2, make it this: nearly every test file's most
 interesting test isn't the "happy path" one — it's the one pinning down a *boundary*
