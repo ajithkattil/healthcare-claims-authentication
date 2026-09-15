@@ -30,6 +30,115 @@ implement encryption, BAAs with vendors, or access logging.
 | `requirements.txt` | Python dependencies, including the Anthropic SDK and `rank_bm25`. |
 | `.env.example` | Template for API keys, only needed if you flip to live mode. |
 
+## Agentic AI Pattern Mapping
+
+Cross-referencing this project against "Agentic AI: Foundations, Patterns & Architecture"
+(Ajith Kattil / Neural Labs, Sept 2026) — a practitioner's terminology and pattern
+reference. Section numbers below refer to that document. The point of this section is
+to be precise about what's actually implemented in these scripts vs. designed-but-not-built
+(covered elsewhere in `Claims_Authentication_E2E_Architecture (5).md` and
+`agentic_patterns_review.md`) vs. genuinely not applicable here.
+
+### 1. Autonomy spectrum
+
+This project is an **LLM-augmented workflow**, not an autonomous agent. `build_graph()`'s
+conditional-edge functions (`route_after_identity`, `route_after_confidence_gate`,
+`route_after_evaluator`, etc.) — plain code reading state fields — decide what node runs
+next. The LLM calls inside `billing_coding_specialist`, `narrative_fraud_specialist`,
+`supervisor_synthesize`, and `evaluator_optimizer_check` reason only *within* their node;
+none of them choose which node executes next. That's a deliberate choice, not a
+limitation — a regulated, auditable domain favors a workflow's traceability over an
+agent's flexibility (Section 1.1).
+
+### 2. Core building blocks
+
+| Component | This project |
+|---|---|
+| Model | Claude (`LLM_MODEL`, Sonnet-tier) for reasoning; a cheaper Haiku tier specifically for `evaluator_optimizer_check`'s faithfulness check |
+| Tools / Actions | `cohere_embed`, `pinecone_query_hybrid`, `zapier_notify` — direct SDK calls today, not yet MCP servers (Section 6 gap, below) |
+| Memory | `ClaimState` checkpointed per `thread_id` (short-term); SQLite embedding cache; long-term claim history + FWA vector store are designed in the E2E architecture doc but not in these POC scripts |
+| Orchestrator | LangGraph `StateGraph` — explicit nodes + conditional edges, not an LLM-driven loop |
+| Guardrails | `run_input_guardrail`, `run_output_guardrail`, `confidence_decision_gate`, `circuit_breaker_escalate` |
+| Observability | The `log` field (printed trace) only, in the POC — RAGAS/DeepEval/Arize-style tracing is designed, not implemented. The single biggest real gap against this reference doc. |
+
+### 3. Foundational single-agent patterns
+
+- **Reflection / self-critique (3.4) — implemented.** `evaluator_optimizer_check` is the
+  critic, `supervisor_synthesize` is the generator, `supervisor_synthesize_retry` is the
+  bounded one-time revision (`MAX_EVALUATOR_REGENERATIONS = 1`) — the textbook
+  generator-critic loop.
+- **Plan-and-Execute (3.3) — matches in spirit, more rigid in practice.** The reference
+  doc names claim-processing workflows as a best fit for this pattern; this project goes
+  a step further for auditability — the "plan" (intake → verify → coverage → rule flags →
+  retrieval → reasoning → gate) is fixed in the graph topology at build time, not produced
+  per-claim by a planner LLM.
+- **Tool use / function calling (3.5) — implemented, but via direct SDK calls**, not
+  schema-driven function-calling or MCP (Section 6 gap again).
+- **ReAct (3.2) — deliberately not used.** No node re-plans "what to do next" turn by
+  turn; that's the same autonomy-spectrum choice as Section 1.
+
+### 4. Multi-agent architectures
+
+**Supervisor (orchestrator-worker) topology — implemented, in a lightweight form.**
+`billing_coding_specialist` and `narrative_fraud_specialist` are the workers (fanned out
+in parallel off `retrieve_guidelines`), `supervisor_synthesize` is the supervisor. One
+honest caveat against the doc's own stricter Section 1.1 definition of "multi-agent": the
+"workers" here are single-shot LLM calls, not agents running their own perceive-reason-act
+loop — a fixed pipeline wearing supervisor/worker naming, not a true multi-agent system.
+That's consistent with Section 4's own rule of thumb ("start with a single agent... 
+multi-agent systems multiply cost, latency, and debugging surface — they are a scaling
+tool, not a maturity badge").
+
+### 5. Memory architectures
+
+| Type | Status |
+|---|---|
+| Working memory | The node's view of `ClaimState` during execution |
+| Short-term / session | Implemented — `SqliteSaver`, checkpointed per `thread_id` |
+| Semantic | Implemented (mocked) — FWA case + guideline embeddings, hybrid dense+BM25 |
+| Episodic | Designed, not in POC — claim-history table in the E2E architecture doc |
+| Procedural | Designed, not in POC — prompt/policy versioning in the E2E architecture doc |
+
+### 6. MCP / A2A
+
+Neither is implemented. Cohere, Pinecone, and Zapier are hardcoded SDK integrations
+inside graph nodes, not MCP servers — `agentic_patterns_review.md` already flags
+re-platforming them behind MCP as the single highest-value next step for this project.
+A2A doesn't apply here: the specialists are functions inside one process, not
+independently-built agents needing cross-vendor discovery/delegation.
+
+### 7. Agentic RAG
+
+This project is close to the reference doc's own worked example — Section 7 literally
+cites "hybrid-retrieval, confidence-gated designs for domains like claims authentication."
+
+| Sub-pattern | Status |
+|---|---|
+| Router / Planner | Partial — the low-risk pre-filter that would route claims around retrieval entirely is designed, not in POC; retrieval strategy itself is fixed (always hybrid), not chosen per-query |
+| Hybrid retrieval | Implemented — `_hybrid_rank` fuses dense (Cohere/Pinecone) + BM25; `large_document_chunking_hybrid_retrieval.py` also compares weighted-fusion vs. Reciprocal Rank Fusion side by side |
+| Reranking | **Not implemented** — no cross-encoder reranking step; ranking is the fusion score alone. Real gap. |
+| Confidence gate | Implemented — `confidence_decision_gate` |
+
+### 8. Orchestration framework
+
+LangGraph — matching the reference doc's own description of its strength: "native
+checkpointing + `interrupt_before` for pausing on human review" is exactly what
+`route_to_siu_review`'s human-in-the-loop pause does in this project.
+
+### 9. Guardrails, evaluation & production concerns
+
+- **Guardrails (9.1) — all five implemented:** input validation, output validation,
+  confidence gates, circuit breakers, and a human-in-the-loop interrupt.
+- **Evaluation (9.2) — partial.** `evaluator_optimizer_check` is a lightweight
+  LLM-as-judge. Golden-dataset regression testing and trace-based observability
+  (LangSmith/Langfuse/Arize) are **not** implemented — the manual "Testing checklist"
+  above is the closest substitute today.
+- **Cost & latency (9.3) — partial.** Caching is implemented (embedding cache); the
+  specialist fan-out is a real instance of parallel tool calls (9.3's "batching"). Model
+  routing by task difficulty is designed (gateway tier policy) but only lightly present
+  in the POC — the evaluator's Haiku-tier call is the one working example of routing to
+  a cheaper model.
+
 ## Prerequisites
 
 - Python 3.10 or later (developed and tested on 3.12)
