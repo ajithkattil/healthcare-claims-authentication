@@ -59,7 +59,7 @@ flowchart TD
 
     subgraph MCP["MCP TOOL LAYER [MCP]<br/>stateless core · cacheable lists · issuer-bound auth (2026-07-28 spec)"]
         COHERE["Cohere Embeddings — MCP server"]
-        PINE["Pinecone/FAISS Retrieval — MCP server"]
+        PINE["Pinecone Retrieval — MCP server"]
         ZAP["Zapier Notification — MCP server"]
     end
     COHERE -.-> EMB
@@ -191,7 +191,7 @@ Every escalation the reviewer confirms as fraud feeds back into long-term memory
 
 ## 13. MCP Tool Layer `MCP`
 
-Cohere, Pinecone/FAISS, and Zapier are exposed as standardized MCP servers rather than hardcoded SDK calls inside graph nodes — the difference between an agent with fixed tool integrations and one with a swappable, standardized tool interface. The July 2026 spec update matters concretely here:
+Cohere, Pinecone, and Zapier are exposed as standardized MCP servers rather than hardcoded SDK calls inside graph nodes — the difference between an agent with fixed tool integrations and one with a swappable, standardized tool interface. The July 2026 spec update matters concretely here:
 
 - **Stateless protocol core** — any request can land on any server instance behind a plain round-robin load balancer (no session affinity to manage under load)
 - **List caching** (`ttlMs`, `cacheScope`) — stops the gateway from re-fetching tool/prompt lists every call

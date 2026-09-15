@@ -46,7 +46,7 @@
 | Orchestration | LangGraph (Python) | State machine, conditional routing, checkpointing |
 | LLM reasoning | Claude (tiered: Haiku / Sonnet / Opus) | Guideline-grounded fraud/anomaly reasoning |
 | Embeddings | Cohere `embed-english-v3.0` | Narrative and guideline chunk embeddings |
-| Dense retrieval | Pinecone (namespaced per corpus, per tenant) — FAISS is a viable self-hosted alternative where a managed index isn't wanted | Vector similarity search |
+| Dense retrieval | Pinecone (namespaced per corpus, per tenant) | Vector similarity search |
 | Keyword retrieval | `rank_bm25` (local, in-process) | Exact-term matching over the same chunk set |
 | Fusion | Weighted min-max normalized sum + Reciprocal Rank Fusion | Combines dense + keyword rankings |
 | Checkpoint / short-term state | Postgres (SQLite in POC) via LangGraph's checkpoint API | Per-claim run state, resumable on failure |
@@ -92,7 +92,7 @@
                                    ▼
  ┌───────────────────────────────────────────────────────────────────────────┐
  │  ORCHESTRATION (LangGraph StateGraph — patient-file-style shared state,  │
- │  checkpointed after every node; per-tenant FAISS/Pinecone index)         │
+ │  checkpointed after every node; per-tenant Pinecone index)         │
  │                                                                            │
  │   intake → verify_identity → check_coverage ─┐                           │
  │                                                 ▼                          │
@@ -257,7 +257,7 @@ Enforced at every boundary the claim crosses, deliberately redundant rather than
 
 - **At the gateway:** structured identifier fields are swapped for reversible tokens by a tokenization service backed by a vault in a private subnet; everything downstream operates on tokens, never the underlying identifier.
 - **At the input guardrail:** free-text narrative fields are scanned for PHI patterns typed directly into a notes box — the control that catches what field-name-based tokenization misses.
-- **At every external call boundary** (Cohere, Pinecone/FAISS, Zapier, the LLM provider): only tokenized identifiers and de-identified narrative text leave the trust boundary, and every such vendor requires a signed Business Associate Agreement before any real PHI-adjacent data flows to it. The Zapier payload carries `claim_id` and fraud flags — never narrative text — so a reviewer pulls clinical detail from the internal system, not a third-party webhook log.
+- **At every external call boundary** (Cohere, Pinecone, Zapier, the LLM provider): only tokenized identifiers and de-identified narrative text leave the trust boundary, and every such vendor requires a signed Business Associate Agreement before any real PHI-adjacent data flows to it. The Zapier payload carries `claim_id` and fraud flags — never narrative text — so a reviewer pulls clinical detail from the internal system, not a third-party webhook log.
 - **In the cache and long-term memory:** both keyed by tokenized identifiers, inside the same encrypted-at-rest, access-controlled boundary as the rest of the PHI estate.
 - **In logs and traces:** claim and decision IDs only, never clinical narrative text.
 - **Token resolution** is a distinct, separately-audited, RBAC-gated operation, never an implicit side effect of anything else.

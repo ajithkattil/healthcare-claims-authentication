@@ -112,11 +112,7 @@ maintain, measure, and improve once it's live, not just something that works in 
 not a description of these scripts running as-is. `Claims_Authentication_E2E_Architecture
 (5).md` has the full production design, and the
 [Agentic AI Pattern Mapping](#agentic-ai-pattern-mapping) section below states exactly
-what's implemented in these scripts today vs. designed for that production version. One
-concrete difference worth naming: this narrative and the wider architecture doc both
-reference FAISS as the dense-retrieval layer, since it's a common self-hosted choice for
-data-residency-sensitive environments; this repo's code runs against Pinecone instead —
-functionally the same role (dense vector search), different vendor.*
+what's implemented in these scripts today vs. designed for that production version.*
 
 **PHI note:** all patient IDs and claim narratives in this POC are synthetic. See
 the docstring in each script for what a real deployment would need to add before
