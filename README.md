@@ -229,6 +229,60 @@ observability — and keep `model_gateway_decide` as the custom routing *policy*
 into it. Don't rebuild undifferentiated infrastructure; do own the domain-specific decision
 logic, since that's where the compliance and business requirements actually live.
 
+## Decoupling from LangGraph (worked example: porting to CrewAI Flows)
+
+This project reads as LangGraph-specific, but going function-by-function through
+`claims_auth_hybrid_rag_confidence_circuitbreaker.py` shows that's mostly an illusion. Of
+roughly 25 functions that make up the actual business logic — every guardrail, the hybrid
+retrieval, both specialists, the supervisor, the evaluator-optimizer, the model gateway,
+the confidence gate, approve/reject — **exactly one** touches a LangGraph-specific object
+(`check_similar_fraud_cases_hybrid` reads `config["configurable"]["thread_id"]`, only to
+drive the circuit-breaker demo trigger), and **one** field in `ClaimState`
+(`log: Annotated[list[str], operator.add]`) uses a LangGraph-specific reducer annotation.
+Everything else is a plain function: takes a dict, reads some keys, returns a dict of
+updates, zero `langgraph` imports. That part is already portable — moving it to a
+different orchestrator is closer to a day of mechanical work than a redesign.
+
+What's genuinely coupled is `build_graph()`'s topology definition (`StateGraph`,
+`add_node`, `add_conditional_edges`, `g.compile(checkpointer=..., interrupt_before=[...])`)
+and the runtime driver calls (`graph.invoke`, `graph.get_state`, `graph.update_state`) —
+the entire durable pause/resume mechanic that lets a claim genuinely stop mid-execution,
+survive the process dying, and resume later with an externally injected SIU decision
+without re-running anything upstream. That piece needs the target engine's own equivalent
+durability primitive — it isn't boilerplate you swap out, since not every orchestrator has
+this capability at all, let alone with the same guarantees.
+
+**Concretely, porting to [CrewAI Flows](https://docs.crewai.com/en/concepts/flows)** (a
+reasonable comparison since, as of its 2026 docs, it now has genuine deterministic
+state-machine and human-in-the-loop primitives, not just autonomous agent crews) maps like
+this:
+
+| This repo (LangGraph) | CrewAI Flows equivalent |
+|---|---|
+| `ClaimState` (`TypedDict`) | A Pydantic `BaseModel`, passed as `Flow[ClaimState]` |
+| A node function (`state -> dict` of updates) | An `@start()` / `@listen()` method on the `Flow` subclass, mutating `self.state.field` directly instead of returning a partial dict for a reducer to merge |
+| `route_after_X(state) -> str` + the `add_conditional_edges` mapping dict | An `@router()` method returning the same label string, paired with `@listen("label")` methods — the same "return a string key, branch on it" shape |
+| Parallel fan-out/fan-in (`retrieve_guidelines` → both specialists → `supervisor_synthesize`) | `@listen(and_(billing_coding_specialist, narrative_fraud_specialist))` on `supervisor_synthesize` — CrewAI's `and_()`/`or_()` helpers exist specifically for this |
+| `SqliteSaver` checkpointer | The `@persist` decorator — backed by `SQLiteFlowPersistence` by default, the same storage engine this repo already uses |
+| `thread_id` (`config["configurable"]["thread_id"]`) | `self.state.id`, a UUID CrewAI auto-generates per flow run; resuming a specific run is `kickoff(inputs={"id": <uuid>})` |
+| `interrupt_before=["route_to_siu_review"]` + `graph.get_state`/`update_state`/`invoke(None, config)` | The `@human_feedback(message=..., emit=[...])` decorator — arguably a *cleaner* fit for this exact case than LangGraph's more general `interrupt_before`, since named outcomes (`"APPROVED_BY_DEMO_REVIEWER"` / `"DENIED_BY_DEMO_REVIEWER"`) are a first-class concept instead of a generic pause-and-patch-state pattern |
+| `billing_coding_specialist` / `narrative_fraud_specialist` as single-shot LLM calls | Could stay exactly as-is (plain function calls inside a `Flow` method), or be upgraded to real CrewAI `Agent`s inside a `Crew` if you wanted them to become genuinely autonomous reasoning loops rather than single-shot calls — see the honest caveat in the Agentic AI Pattern Mapping's Section 4 about this being "a fixed pipeline wearing supervisor/worker naming" today |
+
+**What wouldn't change at all:** every guardrail function, `model_gateway_decide`, the
+hybrid retrieval (`_hybrid_rank`, `pinecone_query_hybrid`, `retrieve_guidelines_hybrid`),
+both specialists' review functions, `supervisor_synthesize_findings`, and
+`evaluator_optimizer_faithfulness_check` — all copy-paste unchanged, called as plain
+functions from inside whichever `Flow` method needs them.
+
+**A rough phased plan**, in the order it'd actually get done: (1) redefine `ClaimState` as
+a Pydantic model; (2) port each LangGraph node to a `Flow` method — mostly mechanical,
+find/replace `return {...}` with `self.state.field = ...`; (3) replace each
+`add_conditional_edges` mapping with an `@router()`/`@listen()` pair; (4) replace
+`SqliteSaver` + `interrupt_before` with `@persist` + `@human_feedback`; (5) re-run the four
+demo scenarios (clean / circuit-breaker / near-exact-match / ambiguous) and confirm
+identical decisions — the actual regression test that the port didn't change behavior, not
+just that it compiles.
+
 ## Architecture
 
 ![Healthcare Claims Authentication architecture diagram](architecture_diagram_final.png)
