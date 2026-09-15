@@ -376,6 +376,8 @@ maps to standard agentic-AI terminology.
 | `app.py` | Gradio web UI wrapping the primary graph for interactive, shareable use (preset + custom mock claims, interactive human-in-the-loop review). Deploy target: Hugging Face Spaces — see "Sharing this app" below. |
 | `requirements.txt` | Python dependencies, including the Anthropic SDK, `rank_bm25`, and `gradio`. |
 | `.env.example` | Template for API keys, only needed if you flip to live mode. |
+| `evals/` | Automated evals suite (pytest) covering guardrails, the model gateway, the confidence gate, the circuit breaker, retrieval quality, and end-to-end golden-claim regression. See [Evals Framework](#evals-framework) below. |
+| `requirements-eval.txt` | Dependencies for `evals/` (just `pytest` — see the file for why `ragas`/`deepeval` aren't included here). |
 
 ## Agentic AI Pattern Mapping
 
@@ -477,9 +479,13 @@ checkpointing + `interrupt_before` for pausing on human review" is exactly what
 - **Guardrails (9.1) — all five implemented:** input validation, output validation,
   confidence gates, circuit breakers, and a human-in-the-loop interrupt.
 - **Evaluation (9.2) — partial.** `evaluator_optimizer_check` is a lightweight
-  LLM-as-judge. Golden-dataset regression testing and trace-based observability
-  (LangSmith/Langfuse/Arize) are **not** implemented — the manual "Testing checklist"
-  above is the closest substitute today.
+  LLM-as-judge. Golden-dataset regression testing **is** implemented — see
+  [Evals Framework](#evals-framework) (`pytest evals/`, 44 tests: guardrails, model
+  gateway, confidence gate, circuit breaker, retrieval-quality precision/recall, and
+  12 end-to-end golden claims). What's still missing: trace-based observability
+  (LangSmith/Langfuse/Arize), and LLM-judged faithfulness/answer-relevancy scoring
+  against a real (non-mock) model, which the Evals Framework section explains isn't
+  meaningful until `USE_LIVE_APIS = True`.
 - **Cost & latency (9.3) — mostly implemented.** Caching is implemented (embedding
   cache); the specialist fan-out is a real instance of parallel tool calls (9.3's
   "batching"); and model routing by task difficulty is now a genuine per-claim decision —
@@ -715,7 +721,9 @@ If you do want to run against real services:
 
 ## Testing checklist
 
-Run through these to confirm the POC behaves as documented:
+Run through these to confirm the POC behaves as documented. Every item below now also
+has an automated equivalent in `pytest evals/` — see [Evals Framework](#evals-framework)
+right after this checklist.
 
 - [ ] `concepts_demo_failure_recovery.py` Run 1 fails inside `process_data`, Run 2 shows only
       `process_data` and `summarize` re-executing (no repeated `fetch_data`/`validate_data` prints)
@@ -755,6 +763,72 @@ Run through these to confirm the POC behaves as documented:
 - [ ] Re-running a script twice **without** deleting the checkpoint file for a
       `thread_id` that already reached `END` is a no-op re-fetch of the final state,
       not a re-execution (LangGraph will not re-run a completed thread)
+
+## Evals Framework
+
+The manual checklist above is eyeballed output; `evals/` is the automated version of
+the same idea, run with:
+
+```bash
+pip install -r requirements-eval.txt
+pytest evals/ -v
+```
+
+44 tests today, organized in layers that mirror the architecture rather than one flat
+pile of assertions:
+
+1. **Component tests — guardrails, model gateway, confidence gate, circuit breaker**
+   (`test_guardrails.py`, `test_model_gateway.py`, `test_confidence_gate.py`,
+   `test_circuit_breaker.py`). Each calls the underlying function directly with
+   hand-picked inputs — no graph, no checkpointer — so every threshold in the codebase
+   (the 2000-char narrative cap, the 0.55/0.90 ambiguous-similarity band, the
+   0.85/0.95/0.97 confidence-gate constants, `MAX_TOOL_ERRORS`) gets tested exactly at
+   its boundary, not just with an example that happens to land on one side of it.
+2. **Retrieval quality** (`test_retrieval_quality.py`). Precision@1 and recall@2 for
+   the hybrid dense+BM25 ranker against a hand-labeled set of which FWA case or
+   guideline each probe narrative should match. This is deliberately a small
+   hand-rolled metric rather than RAGAS's non-LLM context-precision/recall
+   metrics — installing `ragas` into an environment that also has this repo's
+   `langgraph` produced a real, reproducible import failure (`ragas`'s default import
+   path pulls in `langchain_community.chat_models.vertexai`, which no longer exists in
+   current `langchain-community` releases; pinning an older `langchain-community` to
+   fix that then collides with the `langchain-core` version `langgraph` itself
+   requires). Precision@1/recall@2 are standard IR metrics regardless of which tool
+   computes them — the numbers wouldn't change if RAGAS's metrics were substituted in
+   once that conflict is resolved upstream, and for a 3-document mock corpus, computing
+   them directly is a few lines of code rather than a dependency to manage.
+3. **End-to-end golden-claim regression** (`test_e2e_golden.py`, `golden_claims.py`).
+   Twelve labeled claims driven through the full compiled graph, asserting the model
+   tier, pause/no-pause state, and (when finalized) the exact decision string. This
+   goes beyond the four demo presets to include boundary cases specifically: an
+   identity rejection, all three input-guardrail rejection paths (length, injection,
+   SSN), the circuit breaker, and — the most interesting ones — a claim at exactly
+   `claim_amount=10000` next to one at `10001`, and a claim with an otherwise-identical
+   narrative padded past the 200-character length signal.
+4. **Not implemented, and why:** faithfulness/answer-relevancy scoring against a
+   real (non-mock) LLM judge. `evaluator_optimizer_faithfulness_check`'s mock-mode
+   logic is a regex over cited ids, not a semantic judgment, so there's nothing
+   meaningfully different to score in mock mode — this layer only means something once
+   `USE_LIVE_APIS = True`. If you want it, RAGAS's `Faithfulness`/`AnswerRelevancy`
+   metrics or DeepEval's `FaithfulnessMetric`/`AnswerRelevancyMetric` are both
+   reasonable choices, and both are LLM-as-judge under the hood (an added cost per
+   eval run, not a free check). Given point 2 above, install whichever one into a
+   **separate virtual environment** from this project's own, rather than adding it to
+   `requirements.txt` directly.
+
+**A genuine finding this suite surfaced while being built, not before:** the model
+gateway's "long/detailed narrative" complexity signal (+1 to the score) can mathematically
+never be the deciding factor in which model tier a claim gets routed to. The other three
+signals only ever contribute a base score of 0, 3, or 4 — never 2 — because the
+"rule flags present" and "high claim value" signals are both driven by the same
+`claim_amount` thresholds in `compute_rule_flags` and therefore always fire together
+(+2 and +2 at once, never +2 alone). Since a base score of exactly 2 never occurs, adding
+1 for a long narrative never crosses the `>= 3` threshold from below.
+`test_model_gateway.py::test_narrative_length_signal_never_flips_tier_alone` proves this
+generally; `golden_claims.py`'s `narrative_length_alone_never_flips_tier` case confirms it
+end-to-end. This isn't a bug — the threshold design is still defensible — but it means
+that reason string is, today, cosmetic rather than load-bearing, which is worth knowing
+before citing narrative length as a real routing factor.
 
 ## Troubleshooting
 

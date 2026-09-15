@@ -1,0 +1,13 @@
+# Dependencies for the automated evals suite in evals/ (run with: pytest evals/ -v).
+# Install alongside requirements.txt -- these tests import
+# claims_auth_hybrid_rag_confidence_circuitbreaker.py directly, so its own
+# dependencies (langgraph, rank_bm25) must already be installed too.
+pytest>=7.4
+
+# NOT included here: ragas / deepeval. Both are reasonable open-source choices
+# for the LLM-judged faithfulness/answer-relevancy layer this suite doesn't
+# attempt (see README.md's Evals Framework section) -- but installing ragas
+# into this project's environment produces a real, reproducible import
+# failure against langgraph's own langchain-core pin. If you want that layer,
+# install ragas or deepeval into a SEPARATE virtual environment rather than
+# this project's venv, and see the README section for what that would test.
